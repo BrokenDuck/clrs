@@ -17,11 +17,10 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
-import chex
 from clrs._src import probing
 from clrs._src import samplers
 from clrs._src import specs
-import jax
+from clrs._src import tree
 import numpy as np
 
 
@@ -59,7 +58,7 @@ class SamplersTest(parameterized.TestCase):
     feedback_2 = sampler_2.next(batch_size)
 
     # Validate that datasets are the same.
-    jax.tree_util.tree_map(
+    tree.map_arrays(
         np.testing.assert_array_equal,
         feedback_1,
         feedback_2,
@@ -95,7 +94,7 @@ class SamplersTest(parameterized.TestCase):
     sample_1 = sampler_1.next(batch_size)
     sample_2 = sampler_2.next(batch_size)
 
-    jax.tree_util.tree_map(
+    tree.map_arrays(
         lambda *args: np.testing.assert_array_almost_equal(
             *args, decimal=truncate_decimals - 2
         ),
@@ -104,14 +103,14 @@ class SamplersTest(parameterized.TestCase):
     )
 
     def check_for_close_equality():
-      jax.tree_util.tree_map(
+      tree.map_arrays(
           lambda *args: np.testing.assert_array_almost_equal(
               *args, decimal=truncate_decimals + 1
           ),
           sample_1,
           sample_2,
       )
-      jax.tree_util.tree_map(
+      tree.map_arrays(
           np.testing.assert_array_equal,
           sample_1,
           sample_2,
@@ -354,7 +353,7 @@ class AuxiliaryFunctionsTest(parameterized.TestCase):
     )
 
     actual = sampler._trunc_array(input_data)
-    chex.assert_trees_all_equal(actual, expected_output)
+    tree.map_arrays(np.testing.assert_array_equal, actual, expected_output)
 
   @parameterized.named_parameters(
       dict(
@@ -560,7 +559,7 @@ class ProcessRandomPosTest(parameterized.TestCase):
         fixed_pos.data, np.broadcast_to(expected, (batch_size, length)))
 
     batch_with_rand_pos.features.inputs[pos_idx] = fixed_pos
-    chex.assert_trees_all_equal(batch_with_rand_pos, batch_without_rand_pos)
+    tree.map_arrays(np.testing.assert_array_equal, batch_with_rand_pos, batch_without_rand_pos)
 
 
 if __name__ == '__main__':

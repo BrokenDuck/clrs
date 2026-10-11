@@ -25,8 +25,8 @@ from clrs._src import losses
 from clrs._src import probing
 from clrs._src import samplers
 from clrs._src import specs
-import jax
-import jax.numpy as jnp
+import torch
+from torch.nn.functional import one_hot
 import numpy as np
 
 _Array = np.ndarray
@@ -54,42 +54,42 @@ def _make_iterable_sampler(
 def _as_pred_data(x, nb_nodes, seed, batch_axis):
   """Fake a prediction from a data point."""
   # Permute along batch axis to make the prediction different.
-  key = jax.random.PRNGKey(seed)
-  data = jax.random.permutation(key, x.data, axis=batch_axis)
+  key = torch.Generator().manual_seed(seed)
+  data = torch.as_tensor(x.data).index_select(batch_axis, torch.randperm(x.data.shape[batch_axis], generator=key))
   # Extend to one-hot for pointer types.
   if x.type_ == specs.Type.POINTER:
-    return jax.nn.one_hot(data, nb_nodes)
+    return one_hot(data.long(), nb_nodes).float()
   return data
 
 
 def _mask_datapoint(x, seed, t_axis=None):
   """Add some masking to data."""
-  key = jax.random.PRNGKey(seed)
-  data = x.data
+  key = torch.Generator().manual_seed(seed)
+  data = torch.as_tensor(x.data)
   if x.type_ == specs.Type.MASK:
     # mask some data at random
     mask_shape = list(data.shape)
     if t_axis is not None:
       mask_shape[t_axis] = 1
-    mask = jax.random.uniform(key, tuple(mask_shape)) < 0.2
-    data = jnp.where(mask, specs.OutputClass.MASKED, data)
+    mask = torch.rand(tuple(mask_shape), generator=key) < 0.2
+    data = torch.where(mask, specs.OutputClass.MASKED, data)
   elif x.type_ in [specs.Type.CATEGORICAL, specs.Type.MASK_ONE]:
     # mask some data at random (all categories together)
     mask_shape = list(data.shape)[:-1]
     if t_axis is not None:
       mask_shape[t_axis] = 1
-    mask = jax.random.uniform(key, tuple(mask_shape)) < 0.2
-    data = jnp.where(mask[..., None], specs.OutputClass.MASKED, data)
+    mask = torch.rand(tuple(mask_shape), generator=key) < 0.2
+    data = torch.where(mask[..., None], specs.OutputClass.MASKED, data)
   return probing.DataPoint(name=x.name, location=x.location, type_=x.type_,
                            data=data)
 
 
 def _rand_diff(seed, shape):
-  return 2.0 * jax.random.uniform(jax.random.PRNGKey(seed), shape) - 1.0
+  return 2.0 * torch.rand(shape, generator=torch.Generator().manual_seed(seed)) - 1.0
 
 
 def _rand_mask(seed, shape, p=0.5):
-  return (jax.random.uniform(jax.random.PRNGKey(seed), shape) > p).astype(float)
+  return (torch.rand(shape, generator=torch.Generator().manual_seed(seed)) > p).float()
 
 
 def invert(d):

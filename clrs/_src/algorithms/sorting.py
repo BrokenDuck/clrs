@@ -29,7 +29,7 @@ See "Introduction to Algorithms" 3ed (CLRS3) for more information.
 
 from typing import Tuple
 
-import chex
+from clrs._src.validation import assert_rank
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
@@ -42,7 +42,7 @@ _Out = Tuple[_Array, probing.ProbesDict]
 def insertion_sort(A: _Array) -> _Out:
   """Insertion sort."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
   probes = probing.initialize(specs.SPECS['insertion_sort'])
 
   A_pos = np.arange(A.shape[0])
@@ -98,7 +98,7 @@ def insertion_sort(A: _Array) -> _Out:
 def bubble_sort(A: _Array) -> _Out:
   """Bubble sort."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
   probes = probing.initialize(specs.SPECS['bubble_sort'])
 
   A_pos = np.arange(A.shape[0])
@@ -149,7 +149,7 @@ def bubble_sort(A: _Array) -> _Out:
 def heapsort(A: _Array) -> _Out:
   """Heapsort (Williams, 1964)."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
   probes = probing.initialize(specs.SPECS['heapsort'])
 
   A_pos = np.arange(A.shape[0])
@@ -245,7 +245,7 @@ def heapsort(A: _Array) -> _Out:
 def quicksort(A: _Array, A_pos=None, p=None, r=None, probes=None) -> _Out:
   """Quicksort (Hoare, 1962)."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
 
   def partition(A, A_pos, p, r, probes):
     x = A[r]

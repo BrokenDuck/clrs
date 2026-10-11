@@ -26,7 +26,7 @@ See "Introduction to Algorithms" 3ed (CLRS3) for more information.
 
 from typing import Any, Union
 
-import chex
+from clrs._src.validation import assert_rank
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
@@ -46,7 +46,7 @@ def find_maximum_subarray(
 ) -> _Out:
   """Maximum subarray."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
   def find_max_crossing_subarray(A, A_pos, low, mid, high, left_ctx, right_ctx,
                                  probes):
     (left_low, left_high, l_ctx_sum) = left_ctx
@@ -390,7 +390,7 @@ def find_maximum_subarray(
 def find_maximum_subarray_kadane(A: _Array) -> _Out:
   """Kadane's variant of Maximum subarray (Bentley, 1984)."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
   probes = probing.initialize(specs.SPECS['find_maximum_subarray_kadane'])
 
   A_pos = np.arange(A.shape[0])

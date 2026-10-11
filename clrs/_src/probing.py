@@ -23,15 +23,12 @@ format (`ProbesDict`) to facilate efficient contest-based look-up.
 
 """
 
-import functools
 from typing import Dict, List, Tuple, Union
 
 import attr
 from clrs._src import specs
-import jax
-import jax.numpy as jnp
+import torch
 import numpy as np
-import tensorflow as tf
 
 
 _Location = specs.Location
@@ -39,7 +36,7 @@ _Stage = specs.Stage
 _Type = specs.Type
 _OutputClass = specs.OutputClass
 
-_Array = np.ndarray | jax.Array
+_Array = np.ndarray | torch.Tensor
 _Data = Union[_Array, List[_Array]]
 _DataOrType = Union[_Data, str]
 
@@ -48,17 +45,11 @@ ProbesDict = Dict[
 
 
 def _convert_to_str(element):
-  if isinstance(element, tf.Tensor):
-    return element.numpy().decode('utf-8')
-  elif isinstance(element, (np.ndarray, bytes)):
-    return element.decode('utf-8')  # pyrefly: ignore[missing-attribute]
-  else:
-    return element
+  if isinstance(element, np.ndarray):
+    element = element.item()
+  return element.decode('utf-8') if isinstance(element, bytes) else element
 
 
-# First anotation makes this object jax.jit/pmap friendly, second one makes this
-# tf.data.Datasets friendly.
-@jax.tree_util.register_pytree_node_class
 @attr.define
 class DataPoint:
   """Describes a data point."""
@@ -145,7 +136,7 @@ def finalize(probes: ProbesDict):
         else:
           # Only one instance of input/output exist. Remove leading axis.
           probes[stage][loc][name]['data'] = np.squeeze(
-              np.array(probes[stage][loc][name]['data']))
+              np.array(probes[stage][loc][name]['data']), axis=0)
 
 
 def split_stages(
@@ -310,128 +301,43 @@ def strings_pred(T_pos: np.ndarray, P_pos: np.ndarray) -> np.ndarray:
   return probe
 
 
-@functools.partial(jnp.vectorize, signature='(n)->(n,n)')
-def predecessor_pointers_to_permutation_matrix(
-    pointers: jnp.ndarray) -> jnp.ndarray:
-  """Converts predecessor pointers to a permutation matrix.
-
-  This function assumes that the pointers represent a linear order of the nodes
-  (akin to a linked list), where each node points to its predecessor and the
-  first node points to itself. It returns a permutation matrix `P` that sorts
-  the nodes into the order implied by the pointers.
-
-  Example:
-  ```
-  pointers = [2, 1, 1]
-  P = [[0, 1, 0],
-       [0, 0, 1],
-       [1, 0, 0]]
-  ```
-
-  Args:
-    pointers: array of shape [N] containing pointers. The pointers are assumed
-      to describe a linear order such that `pointers[i]` is the predecessor
-      of node `i`.
-
-  Returns:
-    Permutation matrix `P` of shape [N, N]. Given node features `x` of shape
-    [N, F], `P @ x` returns sorted node features.
-  """
-  # Find the index of the last node: it's the node that no other node points to.
-  nb_nodes = pointers.shape[-1]
-  pointers_one_hot = jax.nn.one_hot(pointers, nb_nodes)
-  last = pointers_one_hot.sum(-2).argmin()
-
-  # Initialize permutation matrix with zeros.
-  perm = jnp.zeros([nb_nodes, nb_nodes])
-
-  for i in range(nb_nodes - 1, -1, -1):
-    # perm[i, last] = 1
-    perm += (
-        jax.nn.one_hot(i, nb_nodes)[..., None] * jax.nn.one_hot(last, nb_nodes))
-    last = pointers[last]
-
-  return perm
+def _as_tensor(data):
+  return torch.as_tensor(data)
 
 
-@functools.partial(jnp.vectorize, signature='(n,n)->(n)')
-def permutation_matrix_to_predecessor_pointers(
-    perm: jnp.ndarray) -> jnp.ndarray:
-  """Converts a permutation matrix to predecessor pointers.
-
-  Given an [N, N] permutation matrix `P` that sorts a list of nodes, this
-  function returns predecessor pointers that encode the sorted order.
-
-  Example:
-  ```
-  P = [[0, 1, 0],
-       [0, 0, 1],
-       [1, 0, 0]]
-  pointers = [2, 1, 1]
-  ```
-
-  Args:
-    perm: permutation matrix of shape [N, N].
-
-  Returns:
-    An array of shape [N] containing predecessor pointers.
-  """
-  nb_nodes = perm.shape[-1]
-
-  # Initialize pointers to zeros.
-  pointers = jnp.zeros([nb_nodes], dtype=int)
-
-  # idx[i] is the index of the node at position i in the sorted order
-  idx = perm.argmax(-1)
-
-  # pointers[idx[0]] = idx[0]
-  pointers += idx[0] * jax.nn.one_hot(idx[0], nb_nodes)
-
-  for i in range(1, nb_nodes):
-    # pointers[idx[i]] = idx[i - 1]
-    pointers += idx[i - 1] * jax.nn.one_hot(idx[i], nb_nodes)
-
-  # Ensure that the pointers are in the valid range even if the input is badly
-  # formatted. This has no effect for well-formatted input.
-  pointers = jnp.minimum(pointers, nb_nodes - 1)
-
-  return pointers
+def _restore_type(data, original):
+  return data if isinstance(original, torch.Tensor) else data.numpy()
 
 
-@functools.partial(jnp.vectorize, signature='(n)->(n,n),(n)')
-def predecessor_to_cyclic_predecessor_and_first(
-    pointers: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-  """Converts predecessor pointers to cyclic predecessor + first node mask.
+def predecessor_pointers_to_permutation_matrix(pointers):
+  """Convert batched linked-list predecessor pointers to sorting matrices."""
+  p = _as_tensor(pointers).long()
+  n = p.shape[-1]
+  one_hot = torch.nn.functional.one_hot(p, n)
+  last = one_hot.sum(-2).argmin(-1)
+  rows = []
+  for _ in range(n):
+    rows.append(torch.nn.functional.one_hot(last, n))
+    last = p.gather(-1, last.unsqueeze(-1)).squeeze(-1)
+  result = torch.stack(rows[::-1], -2).float()
+  return _restore_type(result, pointers)
 
-  This function assumes that the pointers represent a linear order of the nodes
-  (akin to a linked list), where each node points to its predecessor and the
-  first node points to itself. It returns the same pointers, except that
-  the first node points to the last, and a mask_one marking the first node.
 
-  Example:
-  ```
-  pointers = [2, 1, 1]
-  P = [[0, 0, 1],
-       [1, 0, 0],
-       [0, 1, 0]],
-  M = [0, 1, 0]
-  ```
+def permutation_matrix_to_predecessor_pointers(perm):
+  """Convert batched sorting matrices to linked-list predecessor pointers."""
+  idx = _as_tensor(perm).argmax(-1)
+  values = torch.cat((idx[..., :1], idx[..., :-1]), -1)
+  result = torch.zeros_like(idx).scatter_add(-1, idx, values).clamp_max(idx.shape[-1]-1)
+  return _restore_type(result, perm)
 
-  Args:
-    pointers: array of shape [N] containing pointers. The pointers are assumed
-      to describe a linear order such that `pointers[i]` is the predecessor
-      of node `i`.
 
-  Returns:
-    Permutation pointers `P` of shape [N] and one-hot vector `M` of shape [N].
-  """
-  nb_nodes = pointers.shape[-1]
-  pointers_one_hot = jax.nn.one_hot(pointers, nb_nodes)
-  # Find the index of the last node: it's the node that no other node points to.
-  last = pointers_one_hot.sum(-2).argmin()
-  # Find the first node: should be the only one pointing to itself.
-  first = pointers_one_hot.diagonal().argmax()
-  mask = jax.nn.one_hot(first, nb_nodes)
-  pointers_one_hot += mask[..., None] * jax.nn.one_hot(last, nb_nodes)
-  pointers_one_hot -= mask[..., None] * mask
-  return pointers_one_hot, mask
+def predecessor_to_cyclic_predecessor_and_first(pointers):
+  """Return cyclic predecessor one-hots and a mask selecting the first node."""
+  p = _as_tensor(pointers).long()
+  n = p.shape[-1]
+  hot = torch.nn.functional.one_hot(p, n).float()
+  last = hot.sum(-2).argmin(-1)
+  first = hot.diagonal(dim1=-2, dim2=-1).argmax(-1)
+  mask = torch.nn.functional.one_hot(first, n).float()
+  hot = hot + mask.unsqueeze(-1) * (torch.nn.functional.one_hot(last, n)-mask).unsqueeze(-2)
+  return _restore_type(hot, pointers), _restore_type(mask, pointers)

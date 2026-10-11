@@ -38,7 +38,7 @@ See "Introduction to Algorithms" 3ed (CLRS3) for more information.
 
 from typing import Tuple
 
-import chex
+from clrs._src.validation import assert_rank
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
@@ -52,7 +52,7 @@ _OutputClass = specs.OutputClass
 def dfs(A: _Array) -> _Out:
   """Depth-first search (Moore, 1959)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['dfs'])
 
   A_pos = np.arange(A.shape[0])
@@ -177,7 +177,7 @@ def dfs(A: _Array) -> _Out:
 def bfs(A: _Array, s: int) -> _Out:
   """Breadth-first search (Moore, 1959)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['bfs'])
 
   A_pos = np.arange(A.shape[0])
@@ -222,7 +222,7 @@ def bfs(A: _Array, s: int) -> _Out:
 def topological_sort(A: _Array) -> _Out:
   """Topological sorting (Knuth, 1973)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['topological_sort'])
 
   A_pos = np.arange(A.shape[0])
@@ -342,7 +342,7 @@ def topological_sort(A: _Array) -> _Out:
 def articulation_points(A: _Array) -> _Out:
   """Articulation points."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['articulation_points'])
 
   A_pos = np.arange(A.shape[0])
@@ -518,7 +518,7 @@ def articulation_points(A: _Array) -> _Out:
 def bridges(A: _Array) -> _Out:
   """Bridges."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['bridges'])
 
   A_pos = np.arange(A.shape[0])
@@ -688,7 +688,7 @@ def bridges(A: _Array) -> _Out:
 def strongly_connected_components(A: _Array) -> _Out:
   """Kosaraju's strongly-connected components (Aho et al., 1974)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(
       specs.SPECS['strongly_connected_components'])
 
@@ -930,7 +930,7 @@ def strongly_connected_components(A: _Array) -> _Out:
 def mst_kruskal(A: _Array) -> _Out:
   """Kruskal's minimum spanning tree (Kruskal, 1956)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['mst_kruskal'])
 
   A_pos = np.arange(A.shape[0])
@@ -1081,7 +1081,7 @@ def mst_kruskal(A: _Array) -> _Out:
 def mst_prim(A: _Array, s: int) -> _Out:
   """Prim's minimum spanning tree (Prim, 1957)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['mst_prim'])
 
   A_pos = np.arange(A.shape[0])
@@ -1147,7 +1147,7 @@ def mst_prim(A: _Array, s: int) -> _Out:
 def bellman_ford(A: _Array, s: int) -> _Out:
   """Bellman-Ford's single-source shortest path (Bellman, 1958)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['bellman_ford'])
 
   A_pos = np.arange(A.shape[0])
@@ -1197,7 +1197,7 @@ def bellman_ford(A: _Array, s: int) -> _Out:
 def dijkstra(A: _Array, s: int) -> _Out:
   """Dijkstra's single-source shortest path (Dijkstra, 1959)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['dijkstra'])
 
   A_pos = np.arange(A.shape[0])
@@ -1263,7 +1263,7 @@ def dijkstra(A: _Array, s: int) -> _Out:
 def dag_shortest_paths(A: _Array, s: int) -> _Out:
   """DAG shortest path."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['dag_shortest_paths'])
 
   A_pos = np.arange(A.shape[0])
@@ -1448,7 +1448,7 @@ def dag_shortest_paths(A: _Array, s: int) -> _Out:
 def floyd_warshall(A: _Array) -> _Out:
   """Floyd-Warshall's all-pairs shortest paths (Floyd, 1962)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   probes = probing.initialize(specs.SPECS['floyd_warshall'])
 
   A_pos = np.arange(A.shape[0])
@@ -1503,7 +1503,7 @@ def floyd_warshall(A: _Array) -> _Out:
 def bipartite_matching(A: _Array, n: int, m: int, s: int, t: int) -> _Out:
   """Edmonds-Karp bipartite matching (Edmund & Karp, 1972)."""
 
-  chex.assert_rank(A, 2)
+  assert_rank(A, 2)
   assert A.shape[0] == n + m + 2  # add source and sink vertices
   assert s == 0 and t == n + m + 1  # ensure for consistency
 
@@ -1601,3 +1601,50 @@ def bipartite_matching(A: _Array, n: int, m: int, s: int, t: int) -> _Out:
               'u': probing.mask_one(u, A.shape[0]),
               'phase': 1
           })
+
+
+def min_plus_apsp(A: _Array) -> _Out:
+  """APSP by immutable min-plus squares, with one hint per round.
+
+  Off-diagonal zero denotes an absent edge, as in CLRS Floyd-Warshall.
+  Negative edges are supported; negative cycles are outside the domain.
+  Output Pi[i,j] is j's predecessor on a shortest path from i (or i when
+  unreachable). Distance probes use zero placeholders plus reachability masks.
+  """
+  A = np.asarray(A, dtype=float)
+  if A.ndim != 2 or A.shape[0] != A.shape[1] or not A.shape[0]:
+    raise ValueError('A must be a nonempty square matrix')
+  if not np.isfinite(A).all() or np.any(np.diag(A) < 0):
+    raise ValueError('A must be finite and have no negative self-loops')
+  n = A.shape[0]
+  probes = probing.initialize(specs.SPECS['min_plus_apsp'])
+  adj = probing.graph(A)
+  probing.push(probes, specs.Stage.INPUT, {
+      'pos': np.arange(n) / n, 'A': A.copy(), 'adj': adj.copy()})
+  D = np.where(adj, A, np.inf)
+  np.fill_diagonal(D, 0.)
+  Pi = np.broadcast_to(np.arange(n)[:, None], (n, n)).copy()
+  m = 1
+
+  def push_hint():
+    reachable = np.isfinite(D)
+    probing.push(probes, specs.Stage.HINT, {
+        'Pi_h': Pi.copy(), 'D': np.where(reachable, D, 0.),
+        'msk': reachable.astype(float), 'm': np.array(m, dtype=float)})
+
+  push_hint()
+  while m < n - 1:
+    previous_D, previous_Pi = D.copy(), Pi.copy()
+    # A streaming reduction uses O(n^2) scratch memory, not an n^3 tensor.
+    for k in range(n):
+      candidate = previous_D[:, k, None] + previous_D[None, k, :]
+      improved = candidate < D
+      predecessor = np.broadcast_to(previous_Pi[k, :], (n, n)).copy()
+      predecessor[:, k] = previous_Pi[:, k]  # Empty suffix preserves prefix.
+      D = np.where(improved, candidate, D)
+      Pi = np.where(improved, predecessor, Pi)
+    m *= 2
+    push_hint()
+  probing.push(probes, specs.Stage.OUTPUT, {'Pi': Pi.copy()})
+  probing.finalize(probes)
+  return Pi, probes

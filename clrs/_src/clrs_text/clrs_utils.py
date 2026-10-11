@@ -33,6 +33,7 @@ CLRS_TASKS_WITH_HINTS = tuple(
         'dijkstra',
         'find_maximum_subarray_kadane',
         'floyd_warshall',
+        'min_plus_apsp',
         'graham_scan',
         'heapsort',
         'insertion_sort',

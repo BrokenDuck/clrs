@@ -26,7 +26,7 @@ See "Introduction to Algorithms" 3ed (CLRS3) for more information.
 
 from typing import Tuple
 
-import chex
+from clrs._src.validation import assert_rank
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
@@ -39,7 +39,7 @@ _Out = Tuple[_Array, probing.ProbesDict]
 def activity_selector(s: _Array, f: _Array) -> _Out:
   """Activity selection (Gavril, 1972)."""
 
-  chex.assert_rank([s, f], 1)
+  assert_rank([s, f], 1)
   probes = probing.initialize(specs.SPECS['activity_selector'])
 
   A_pos = np.arange(s.shape[0])
@@ -102,7 +102,7 @@ def activity_selector(s: _Array, f: _Array) -> _Out:
 def task_scheduling(d: _Array, w: _Array) -> _Out:
   """Task scheduling (Lawler, 1985)."""
 
-  chex.assert_rank([d, w], 1)
+  assert_rank([d, w], 1)
   probes = probing.initialize(specs.SPECS['task_scheduling'])
 
   A_pos = np.arange(d.shape[0])

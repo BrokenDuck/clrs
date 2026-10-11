@@ -30,7 +30,7 @@ class DivideAndConquerTest(parameterized.TestCase):
       ("Kadane's variant", divide_and_conquer.find_maximum_subarray_kadane),
   )
   def test_find_maximum_subarray_pos(self, algorithm):
-    A = np.random.randint(0, 100, size=(13,))
+    A = np.random.randint(1, 100, size=(13,))
     (low, high, sum_), _ = algorithm(A)
     self.assertEqual(low, 0)
     self.assertEqual(high, len(A) - 1)

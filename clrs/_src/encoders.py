@@ -15,13 +15,13 @@
 """Encoder utilities."""
 
 import functools
-import chex
+import torch
+from torch import nn
+from torch.nn import functional as F
 from clrs._src import probing
 from clrs._src import specs
-import haiku as hk
-import jax.numpy as jnp
 
-_Array = chex.Array
+_Array = torch.Tensor
 _DataPoint = probing.DataPoint
 _Location = specs.Location
 _Spec = specs.Spec
@@ -32,23 +32,25 @@ _Type = specs.Type
 def construct_encoders(stage: str, loc: str, t: str,
                        hidden_dim: int, init: str, name: str):
   """Constructs encoders."""
-  if init == 'xavier_on_scalars' and stage == _Stage.HINT and t == _Type.SCALAR:
-    initialiser = hk.initializers.TruncatedNormal(
-        stddev=1.0 / jnp.sqrt(hidden_dim))
-  elif init in ['default', 'xavier_on_scalars']:
-    initialiser = None
-  else:
+  if init not in ('default', 'xavier_on_scalars'):
     raise ValueError(f'Encoder initialiser {init} not supported.')
-  linear = functools.partial(
-      hk.Linear,
-      w_init=initialiser,
-      name=f'{name}_enc_linear')
-  encoders = [linear(hidden_dim)]
-  if loc == _Location.EDGE and t == _Type.POINTER:
-    # Edge pointers need two-way encoders.
-    encoders.append(linear(hidden_dim))
+  def linear():
+    return ScalarLazyLinear(hidden_dim, scalar_init=(
+        init == 'xavier_on_scalars' and stage == _Stage.HINT and t == _Type.SCALAR))
+  return nn.ModuleList([linear() for _ in range(2 if loc == _Location.EDGE and t == _Type.POINTER else 1)])
 
-  return encoders
+
+class ScalarLazyLinear(nn.LazyLinear):
+  def __init__(self, hidden_dim, scalar_init=False):
+    self.scalar_init = scalar_init
+    super().__init__(hidden_dim)
+
+  def initialize_parameters(self, inputs):
+    pending = self.has_uninitialized_params()
+    super().initialize_parameters(inputs)
+    if pending and self.scalar_init:
+      nn.init.trunc_normal_(self.weight, std=self.out_features ** -0.5)
+      nn.init.zeros_(self.bias)
 
 
 def preprocess(dp: _DataPoint, nb_nodes: int) -> _DataPoint:
@@ -68,10 +70,11 @@ def preprocess(dp: _DataPoint, nb_nodes: int) -> _DataPoint:
     The datapoint, with data and possibly type modified.
   """
   new_type = dp.type_
-  if dp.type_ == _Type.POINTER:
-    data = hk.one_hot(dp.data, nb_nodes)
+  if dp.type_ in (_Type.POINTER, _Type.SHOULD_BE_PERMUTATION):
+    data = F.one_hot(dp.data.long(), nb_nodes).float()
+    new_type = _Type.POINTER
   else:
-    data = dp.data.astype(jnp.float32)
+    data = dp.data.float()
     if dp.type_ == _Type.SOFT_POINTER:
       new_type = _Type.POINTER
   dp = probing.DataPoint(
@@ -84,11 +87,11 @@ def accum_adj_mat(dp: _DataPoint, adj_mat: _Array) -> _Array:
   """Accumulates adjacency matrix."""
   if dp.location == _Location.NODE and dp.type_ in [_Type.POINTER,
                                                     _Type.PERMUTATION_POINTER]:
-    adj_mat += ((dp.data + jnp.transpose(dp.data, (0, 2, 1))) > 0.5)
+    adj_mat = adj_mat + ((dp.data + dp.data.transpose(1, 2)) > 0.5)
   elif dp.location == _Location.EDGE and dp.type_ == _Type.MASK:
-    adj_mat += ((dp.data + jnp.transpose(dp.data, (0, 2, 1))) > 0.0)
+    adj_mat = adj_mat + ((dp.data + dp.data.transpose(1, 2)) > 0.0)
 
-  return (adj_mat > 0.).astype('float32')
+  return (adj_mat > 0.).float()
 
 
 def accum_edge_fts(encoders, dp: _DataPoint, edge_fts: _Array) -> _Array:
@@ -96,16 +99,16 @@ def accum_edge_fts(encoders, dp: _DataPoint, edge_fts: _Array) -> _Array:
   if dp.location == _Location.NODE and dp.type_ in [_Type.POINTER,
                                                     _Type.PERMUTATION_POINTER]:
     encoding = _encode_inputs(encoders, dp)
-    edge_fts += encoding
+    edge_fts = edge_fts + encoding
 
   elif dp.location == _Location.EDGE:
     encoding = _encode_inputs(encoders, dp)
     if dp.type_ == _Type.POINTER:
       # Aggregate pointer contributions across sender and receiver nodes.
-      encoding_2 = encoders[1](jnp.expand_dims(dp.data, -1))
-      edge_fts += jnp.mean(encoding, axis=1) + jnp.mean(encoding_2, axis=2)
+      encoding_2 = encoders[1](dp.data.unsqueeze(-1))
+      edge_fts = edge_fts + encoding.mean(dim=1) + encoding_2.mean(dim=2)
     else:
-      edge_fts += encoding
+      edge_fts = edge_fts + encoding
 
   return edge_fts
 
@@ -116,7 +119,7 @@ def accum_node_fts(encoders, dp: _DataPoint, node_fts: _Array) -> _Array:
   if ((dp.location == _Location.NODE and not is_pointer) or
       (dp.location == _Location.GRAPH and dp.type_ == _Type.POINTER)):
     encoding = _encode_inputs(encoders, dp)
-    node_fts += encoding
+    node_fts = node_fts + encoding
 
   return node_fts
 
@@ -126,7 +129,7 @@ def accum_graph_fts(encoders, dp: _DataPoint,
   """Encodes and accumulates graph features."""
   if dp.location == _Location.GRAPH and dp.type_ != _Type.POINTER:
     encoding = _encode_inputs(encoders, dp)
-    graph_fts += encoding
+    graph_fts = graph_fts + encoding
 
   return graph_fts
 
@@ -135,5 +138,5 @@ def _encode_inputs(encoders, dp: _DataPoint) -> _Array:
   if dp.type_ == _Type.CATEGORICAL:
     encoding = encoders[0](dp.data)
   else:
-    encoding = encoders[0](jnp.expand_dims(dp.data, -1))
+    encoding = encoders[0](dp.data.unsqueeze(-1))
   return encoding

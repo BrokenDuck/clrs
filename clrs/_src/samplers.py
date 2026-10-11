@@ -26,7 +26,7 @@ from absl import logging
 from clrs._src import algorithms
 from clrs._src import probing
 from clrs._src import specs
-import jax
+from clrs._src import tree
 import numpy as np
 
 
@@ -848,6 +848,7 @@ SAMPLERS = {
     'dag_shortest_paths': DAGPathSampler,
     'dijkstra': BellmanFordSampler,
     'floyd_warshall': FloydWarshallSampler,
+    'min_plus_apsp': FloydWarshallSampler,
     'bipartite_matching': BipartiteSampler,
     'naive_string_matcher': MatcherSampler,
     'kmp_matcher': MatcherSampler,
@@ -873,7 +874,7 @@ def _batch_io(traj_io: Trajectories) -> Trajectory:
       assert dp.data.shape[0] == 1  # batching axis
       assert traj_io[0][i].name == dp.name
 
-  return jax.tree_util.tree_map(lambda *x: np.concatenate(x), *traj_io)
+  return tree.map_arrays(lambda *x: np.concatenate(x), *traj_io)
 
 
 def _batch_hints(
@@ -904,7 +905,7 @@ def _batch_hints(
 
   # Create zero-filled space for the batched hints, then copy each hint
   # up to the corresponding length.
-  batched_traj = jax.tree_util.tree_map(
+  batched_traj = tree.map_arrays(
       lambda x: np.zeros(time_and_batch + x.shape[2:]),
       traj_hints[0])
   hint_lengths = np.zeros(len(traj_hints))

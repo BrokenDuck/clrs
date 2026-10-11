@@ -17,14 +17,13 @@
 import functools
 from typing import Dict, Optional
 
-import chex
+import torch
+from torch import nn
+from torch.nn import functional as F
 from clrs._src import probing
 from clrs._src import specs
-import haiku as hk
-import jax
-import jax.numpy as jnp
 
-_Array = chex.Array
+_Array = torch.Tensor
 _DataPoint = probing.DataPoint
 _Location = specs.Location
 _Spec = specs.Spec
@@ -33,7 +32,7 @@ _Type = specs.Type
 
 
 def log_sinkhorn(x: _Array, steps: int, temperature: float, zero_diagonal: bool,
-                 noise_rng_key: Optional[_Array]) -> _Array:
+                 noise_rng_key: Optional[torch.Generator]) -> _Array:
   """Sinkhorn operator in log space, to postprocess permutation pointer logits.
 
   Args:
@@ -52,22 +51,23 @@ def log_sinkhorn(x: _Array, steps: int, temperature: float, zero_diagonal: bool,
   assert x.shape[-1] == x.shape[-2]
   if noise_rng_key is not None:
     # Add standard Gumbel noise (see https://arxiv.org/abs/1802.08665)
-    noise = -jnp.log(-jnp.log(jax.random.uniform(noise_rng_key,
-                                                 x.shape) + 1e-12) + 1e-12)
+    noise = -torch.log(-torch.log(torch.rand(x.shape, device=x.device, generator=noise_rng_key) + 1e-12) + 1e-12)
     x = x + noise
-  x /= temperature
+  x = x / temperature
   if zero_diagonal:
-    x = x - 1e6 * jnp.eye(x.shape[-1])
+    x = x - 1e6 * torch.eye(x.shape[-1], device=x.device)
   for _ in range(steps):
-    x = jax.nn.log_softmax(x, axis=-1)
-    x = jax.nn.log_softmax(x, axis=-2)
+    x = F.log_softmax(x, dim=-1)
+    x = F.log_softmax(x, dim=-2)
   return x
 
 
 def construct_decoders(loc: str, t: str, hidden_dim: int, nb_dims: int,
                        name: str):
   """Constructs decoders."""
-  linear = functools.partial(hk.Linear, name=f"{name}_dec_linear")
+  if t == _Type.SHOULD_BE_PERMUTATION:
+    t = _Type.POINTER
+  linear = nn.LazyLinear
   if loc == _Location.NODE:
     # Node decoders.
     if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
@@ -107,12 +107,12 @@ def construct_decoders(loc: str, t: str, hidden_dim: int, nb_dims: int,
   else:
     raise ValueError(f"Invalid Location {loc}")
 
-  return decoders
+  return nn.ModuleList(decoders)
 
 
 def construct_diff_decoders(name: str):
   """Constructs diff decoders."""
-  linear = functools.partial(hk.Linear, name=f"{name}_diffdec_linear")
+  linear = nn.LazyLinear
   decoders = {}
   decoders[_Location.NODE] = linear(1)
   decoders[_Location.EDGE] = (linear(1), linear(1), linear(1))
@@ -153,28 +153,30 @@ def postprocess(spec: _Spec, preds: Dict[str, _Array],
   result = {}
   for name in preds.keys():
     _, loc, t = spec[name]
-    new_t = t
+    if t == _Type.SHOULD_BE_PERMUTATION:
+      t = _Type.POINTER
+    new_t = spec[name][2]
     data = preds[name]
     if t == _Type.SCALAR:
       if hard:
-        data = jax.lax.stop_gradient(data)
+        data = data.detach()
     elif t == _Type.MASK:
       if hard:
         data = (data > 0.0) * 1.0
       else:
-        data = jax.nn.sigmoid(data)
+        data = torch.sigmoid(data)
     elif t in [_Type.MASK_ONE, _Type.CATEGORICAL]:
       cat_size = data.shape[-1]
       if hard:
-        best = jnp.argmax(data, -1)
-        data = hk.one_hot(best, cat_size)
+        best = data.argmax(-1)
+        data = F.one_hot(best, cat_size).float()
       else:
-        data = jax.nn.softmax(data, axis=-1)
+        data = F.softmax(data, dim=-1)
     elif t == _Type.POINTER:
       if hard:
-        data = jnp.argmax(data, -1).astype(float)
+        data = data.argmax(-1)
       else:
-        data = jax.nn.softmax(data, -1)
+        data = F.softmax(data, dim=-1)
         new_t = _Type.SOFT_POINTER
     elif t == _Type.PERMUTATION_POINTER:
       # Convert the matrix of logits to a doubly stochastic matrix.
@@ -184,9 +186,9 @@ def postprocess(spec: _Spec, preds: Dict[str, _Array],
           temperature=sinkhorn_temperature,
           zero_diagonal=True,
           noise_rng_key=None)
-      data = jnp.exp(data)
+      data = data.exp()
       if hard:
-        data = jax.nn.one_hot(jnp.argmax(data, axis=-1), data.shape[-1])
+        data = F.one_hot(data.argmax(-1), data.shape[-1]).float()
     else:
       raise ValueError("Invalid type")
     result[name] = probing.DataPoint(
@@ -205,6 +207,7 @@ def decode_fts(
     inf_bias: bool,
     inf_bias_edge: bool,
     repred: bool,
+    generator=None,
 ):
   """Decodes node, edge and graph features."""
   output_preds = {}
@@ -213,10 +216,12 @@ def decode_fts(
   for name in decoders:
     decoder = decoders[name]
     stage, loc, t = spec[name]
+    if t == _Type.SHOULD_BE_PERMUTATION:
+      t = _Type.POINTER
 
     if loc == _Location.NODE:
       preds = _decode_node_fts(decoder, t, h_t, edge_fts, adj_mat,
-                               inf_bias, repred)
+                               inf_bias, repred, generator)
     elif loc == _Location.EDGE:
       preds = _decode_edge_fts(decoder, t, h_t, edge_fts, adj_mat,
                                inf_bias_edge)
@@ -236,11 +241,11 @@ def decode_fts(
 
 
 def _decode_node_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
-                     adj_mat: _Array, inf_bias: bool, repred: bool) -> _Array:
+                     adj_mat: _Array, inf_bias: bool, repred: bool, generator=None) -> _Array:
   """Decodes node features."""
 
   if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-    preds = jnp.squeeze(decoders[0](h_t), -1)
+    preds = torch.squeeze(decoders[0](h_t), -1)
   elif t == _Type.CATEGORICAL:
     preds = decoders[0](h_t)
   elif t in [_Type.POINTER, _Type.PERMUTATION_POINTER]:
@@ -248,17 +253,17 @@ def _decode_node_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
     p_2 = decoders[1](h_t)
     p_3 = decoders[2](edge_fts)
 
-    p_e = jnp.expand_dims(p_2, -2) + p_3
-    p_m = jnp.maximum(jnp.expand_dims(p_1, -2),
-                      jnp.transpose(p_e, (0, 2, 1, 3)))
+    p_e = torch.unsqueeze(p_2, -2) + p_3
+    p_m = torch.maximum(torch.unsqueeze(p_1, -2),
+                      p_e.permute(0, 2, 1, 3))
 
-    preds = jnp.squeeze(decoders[3](p_m), -1)
+    preds = torch.squeeze(decoders[3](p_m), -1)
 
     if inf_bias:
-      per_batch_min = jnp.min(preds, axis=range(1, preds.ndim), keepdims=True)
-      preds = jnp.where(adj_mat > 0.5,
+      per_batch_min = preds.amin(dim=tuple(range(1, preds.ndim)), keepdim=True)
+      preds = torch.where(adj_mat > 0.5,
                         preds,
-                        jnp.minimum(-1.0, per_batch_min - 1.0))
+                        (per_batch_min - 1.0).clamp_max(-1.0))
     if t == _Type.PERMUTATION_POINTER:
       if repred:  # testing or validation, no Gumbel noise
         preds = log_sinkhorn(
@@ -267,7 +272,7 @@ def _decode_node_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
       else:  # training, add Gumbel noise
         preds = log_sinkhorn(
             x=preds, steps=10, temperature=0.1,
-            zero_diagonal=True, noise_rng_key=hk.next_rng_key())
+            zero_diagonal=True, noise_rng_key=generator)
   else:
     raise ValueError("Invalid output type")
 
@@ -281,26 +286,26 @@ def _decode_edge_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
   pred_1 = decoders[0](h_t)
   pred_2 = decoders[1](h_t)
   pred_e = decoders[2](edge_fts)
-  pred = (jnp.expand_dims(pred_1, -2) + jnp.expand_dims(pred_2, -3) + pred_e)
+  pred = (torch.unsqueeze(pred_1, -2) + torch.unsqueeze(pred_2, -3) + pred_e)
   if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-    preds = jnp.squeeze(pred, -1)
+    preds = torch.squeeze(pred, -1)
   elif t == _Type.CATEGORICAL:
     preds = pred
   elif t == _Type.POINTER:
     pred_2 = decoders[3](h_t)
 
-    p_m = jnp.maximum(jnp.expand_dims(pred, -2),
-                      jnp.expand_dims(
-                          jnp.expand_dims(pred_2, -3), -3))
+    p_m = torch.maximum(torch.unsqueeze(pred, -2),
+                      torch.unsqueeze(
+                          torch.unsqueeze(pred_2, -3), -3))
 
-    preds = jnp.squeeze(decoders[4](p_m), -1)
+    preds = torch.squeeze(decoders[4](p_m), -1)
   else:
     raise ValueError("Invalid output type")
   if inf_bias_edge and t in [_Type.MASK, _Type.MASK_ONE]:
-    per_batch_min = jnp.min(preds, axis=range(1, preds.ndim), keepdims=True)
-    preds = jnp.where(adj_mat > 0.5,
+    per_batch_min = preds.amin(dim=tuple(range(1, preds.ndim)), keepdim=True)
+    preds = torch.where(adj_mat > 0.5,
                       preds,
-                      jnp.minimum(-1.0, per_batch_min - 1.0))
+                      (per_batch_min - 1.0).clamp_max(-1.0))
 
   return preds
 
@@ -309,18 +314,18 @@ def _decode_graph_fts(decoders, t: str, h_t: _Array,
                       graph_fts: _Array) -> _Array:
   """Decodes graph features."""
 
-  gr_emb = jnp.max(h_t, axis=-2)
+  gr_emb = h_t.amax(dim=-2)
   pred_n = decoders[0](gr_emb)
   pred_g = decoders[1](graph_fts)
   pred = pred_n + pred_g
   if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-    preds = jnp.squeeze(pred, -1)
+    preds = torch.squeeze(pred, -1)
   elif t == _Type.CATEGORICAL:
     preds = pred
   elif t == _Type.POINTER:
     pred_2 = decoders[2](h_t)
-    ptr_p = jnp.expand_dims(pred, 1) + jnp.transpose(pred_2, (0, 2, 1))
-    preds = jnp.squeeze(ptr_p, 1)
+    ptr_p = torch.unsqueeze(pred, 1) + pred_2.permute(0, 2, 1)
+    preds = torch.squeeze(ptr_p, 1)
   else:
     raise ValueError("Invalid output type")
 
@@ -353,7 +358,7 @@ def maybe_decode_diffs(
 
 def _decode_node_diffs(decoders, h_t: _Array) -> _Array:
   """Decodes node diffs."""
-  return jnp.squeeze(decoders(h_t), -1)
+  return torch.squeeze(decoders(h_t), -1)
 
 
 def _decode_edge_diffs(decoders, h_t: _Array, edge_fts: _Array) -> _Array:
@@ -362,8 +367,8 @@ def _decode_edge_diffs(decoders, h_t: _Array, edge_fts: _Array) -> _Array:
   e_pred_1 = decoders[0](h_t)
   e_pred_2 = decoders[1](h_t)
   e_pred_e = decoders[2](edge_fts)
-  preds = jnp.squeeze(
-      jnp.expand_dims(e_pred_1, -1) + jnp.expand_dims(e_pred_2, -2) + e_pred_e,
+  preds = torch.squeeze(
+      torch.unsqueeze(e_pred_1, -2) + torch.unsqueeze(e_pred_2, -3) + e_pred_e,
       -1,
   )
 
@@ -373,9 +378,9 @@ def _decode_edge_diffs(decoders, h_t: _Array, edge_fts: _Array) -> _Array:
 def _decode_graph_diffs(decoders, h_t: _Array, graph_fts: _Array) -> _Array:
   """Decodes graph diffs."""
 
-  gr_emb = jnp.max(h_t, axis=-2)
+  gr_emb = h_t.amax(dim=-2)
   g_pred_n = decoders[0](gr_emb)
   g_pred_g = decoders[1](graph_fts)
-  preds = jnp.squeeze(g_pred_n + g_pred_g, -1)
+  preds = torch.squeeze(g_pred_n + g_pred_g, -1)
 
   return preds

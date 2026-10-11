@@ -13,52 +13,48 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Tests for processors.py."""
-
-from absl.testing import absltest
-import chex
+"""Every upstream processor variant supports PyTorch training."""
+import pytest
+import torch
 from clrs._src import processors
-import haiku as hk
-import jax.numpy as jnp
+
+KINDS = ['deepsets', 'gat', 'gat_full', 'gatv2', 'gatv2_full',
+         'memnet_full', 'memnet_masked', 'mpnn', 'pgn', 'pgn_mask',
+         'triplet_mpnn', 'triplet_pgn', 'triplet_pgn_mask', 'gpgn',
+         'gpgn_mask', 'gmpnn', 'triplet_gpgn', 'triplet_gpgn_mask', 'triplet_gmpnn']
 
 
-class MemnetTest(absltest.TestCase):
-
-  def test_simple_run_and_check_shapes(self):
-
-    batch_size = 64
-    vocab_size = 177
-    embedding_size = 64
-    sentence_size = 11
-    memory_size = 320
-    linear_output_size = 128
-    num_hops = 2
-    use_ln = True
-
-    def forward_fn(queries, stories):
-      model = processors.MemNetFull(
-          vocab_size=vocab_size,
-          embedding_size=embedding_size,
-          sentence_size=sentence_size,
-          memory_size=memory_size,
-          linear_output_size=linear_output_size,
-          num_hops=num_hops,
-          use_ln=use_ln)
-      return model._apply(queries, stories)
-
-    forward = hk.transform(forward_fn)
-
-    queries = jnp.ones([batch_size, sentence_size], dtype=jnp.int32)
-    stories = jnp.ones([batch_size, memory_size, sentence_size],
-                       dtype=jnp.int32)
-
-    key = hk.PRNGSequence(42)
-    params = forward.init(next(key), queries, stories)
-
-    model_output = forward.apply(params, None, queries, stories)
-    chex.assert_shape(model_output, [batch_size, vocab_size])
-    chex.assert_type(model_output, jnp.float32)
+@pytest.mark.parametrize('kind', KINDS)
+def test_forward_backward(kind):
+    torch.manual_seed(1)
+    processor = processors.get_processor_factory(kind, True, 4, 2)(8)
+    nodes = torch.randn(2, 5, 8, requires_grad=True)
+    edges = torch.randn(2, 5, 5, 8, requires_grad=True)
+    graph = torch.randn(2, 8, requires_grad=True)
+    result, edge = processor(nodes, edges, graph, torch.eye(5).expand(2, 5, 5), torch.zeros_like(nodes))
+    assert result.shape == nodes.shape
+    loss = result.square().sum()
+    if edge is not None:
+        assert edge.shape == edges.shape
+        loss = loss + edge.square().sum()
+    loss.backward()
+    grads = [p.grad for p in processor.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
 
 
-if __name__ == '__main__':
-  absltest.main()
+def test_d2_processor():
+    p = processors.GATv2FullD2(8, 2)
+    result = p.d2_forward([torch.randn(2, 3, 8) for _ in range(4)],
+                         [torch.randn(2, 3, 3, 8) for _ in range(4)],
+                         [torch.randn(2, 8) for _ in range(4)],
+                         torch.ones(2, 3, 3), torch.zeros(2, 3, 8))
+    assert len(result) == 4
+    sum(x.sum() for x in result).backward()
+
+
+@pytest.mark.parametrize('embedding', [True, False])
+def test_memory_hops(embedding):
+    p = processors.MemNetMasked(8, 8, 8, embedding_size=8, num_hops=3, apply_embeddings=embedding)
+    out = p._apply_memory(torch.ones(2, 8), torch.ones(2, 5, 8))
+    assert out.shape == (2, 8)
+    out.sum().backward()

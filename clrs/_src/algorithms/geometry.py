@@ -28,7 +28,7 @@ See "Introduction to Algorithms" 3ed (CLRS3) for more information.
 import math
 from typing import Any, Tuple
 
-import chex
+from clrs._src.validation import assert_rank
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
@@ -162,7 +162,7 @@ def segments_intersect(xs: _Array, ys: _Array) -> _Out:
 def graham_scan(xs: _Array, ys: _Array) -> _Out:
   """Graham scan convex hull (Graham, 1972)."""
 
-  chex.assert_rank([xs, ys], 1)
+  assert_rank([xs, ys], 1)
   probes = probing.initialize(specs.SPECS['graham_scan'])
 
   A_pos = np.arange(xs.shape[0])
@@ -288,7 +288,7 @@ def graham_scan(xs: _Array, ys: _Array) -> _Out:
 def jarvis_march(xs: _Array, ys: _Array) -> _Out:
   """Jarvis' march convex hull (Jarvis, 1973)."""
 
-  chex.assert_rank([xs, ys], 1)
+  assert_rank([xs, ys], 1)
   probes = probing.initialize(specs.SPECS['jarvis_march'])
 
   A_pos = np.arange(xs.shape[0])

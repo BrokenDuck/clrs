@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dm-clrs"
+version = "2.0.3+torch.1"
+description = "PyTorch port of the CLRS Algorithmic Reasoning Benchmark"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+  "absl-py>=2.1", "attrs>=24.2", "numpy>=1.26", "torch>=2.2",
+  "tfrecord>=1.14.4", "scipy>=1.11", "ml-collections>=0.1.1", "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/BrokenDuck/clrs"
+Upstream = "https://github.com/google-deepmind/clrs"
+
+[tool.setuptools.packages.find]
+include = ["clrs*"]
+
+[tool.setuptools.package-data]
+clrs = ["UPSTREAM_COMMIT", "py.typed"]
+
+[tool.pytest.ini_options]
+python_files = ["*_test.py", "test_*.py"]

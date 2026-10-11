@@ -13,742 +13,209 @@
 # limitations under the License.
 # ==============================================================================
 
-"""JAX implementation of CLRS basic network."""
-
-import functools
-
-from typing import Dict, List, Optional, Tuple
-
-import chex
-
-from clrs._src import decoders
-from clrs._src import encoders
-from clrs._src import probing
-from clrs._src import processors
-from clrs._src import samplers
-from clrs._src import specs
-
-import haiku as hk
-import jax
-import jax.numpy as jnp
+"""PyTorch encode-process-decode networks and recurrent chunk state."""
+from dataclasses import dataclass
+import torch
+from torch import nn
+from torch.nn import functional as F
+from clrs._src import decoders, encoders, probing, specs, tree
 
 
-_Array = chex.Array
-_DataPoint = probing.DataPoint
-_Features = samplers.Features
-_FeaturesChunked = samplers.FeaturesChunked
-_Location = specs.Location
-_Spec = specs.Spec
-_Stage = specs.Stage
-_Trajectory = samplers.Trajectory
-_Type = specs.Type
+def _expand_to(x, y):
+    return x.reshape(x.shape + (1,) * (y.ndim-x.ndim))
 
 
-@chex.dataclass
-class _MessagePassingScanState:
-  hint_preds: chex.Array
-  output_preds: chex.Array
-  hiddens: chex.Array
-  lstm_state: Optional[hk.LSTMState]
+def _data_dimensions(features):
+    for dp in features.inputs:
+        if dp.location in (specs.Location.NODE, specs.Location.EDGE):
+            return dp.data.shape[:2]
+    raise ValueError('Inputs must include nodes or edges')
 
 
-@chex.dataclass
-class _MessagePassingOutputChunked:
-  hint_preds: chex.Array
-  output_preds: chex.Array
+def _data_dimensions_chunked(features):
+    return _data_dimensions(features._replace(inputs=tree.map_arrays(lambda x: x[0], features.inputs)))
 
 
-@chex.dataclass
+class Net(nn.Module):
+    def __init__(self, spec, hidden_dim, encode_hints, decode_hints,
+                 processor_factory, use_lstm=False, encoder_init='default',
+                 dropout_prob=0., hint_teacher_forcing=0., hint_repred_mode='soft',
+                 nb_dims=None, nb_msg_passing_steps=1, debug=False, name='net'):
+        super().__init__()
+        if encode_hints and not decode_hints:
+            raise ValueError('Encoding hints requires decoding hints for autoregressive evaluation')
+        if hint_repred_mode not in ('soft', 'hard', 'hard_on_eval'):
+            raise ValueError('Invalid hint_repred_mode')
+        if not 0 <= hint_teacher_forcing <= 1 or not 0 <= dropout_prob < 1:
+            raise ValueError('Invalid teacher forcing or dropout probability')
+        if nb_msg_passing_steps < 1:
+            raise ValueError('At least one message passing step is required')
+        self.spec = spec if isinstance(spec, list) else [spec]
+        self.hidden_dim, self.encode_hints, self.decode_hints = hidden_dim, encode_hints, decode_hints
+        self.use_lstm, self.encoder_init = use_lstm, encoder_init
+        self.dropout_prob, self.hint_teacher_forcing = dropout_prob, hint_teacher_forcing
+        self.hint_repred_mode, self.nb_msg_passing_steps = hint_repred_mode, nb_msg_passing_steps
+        self.debug = debug
+        self.processor = processor_factory(hidden_dim)
+        self.lstm = nn.LSTMCell(hidden_dim, hidden_dim) if use_lstm else None
+        self.encoders, self.decoders = nn.ModuleList(), nn.ModuleList()
+        shared_algo_encoder = None
+        for i, task in enumerate(self.spec):
+            enc, dec = nn.ModuleDict(), nn.ModuleDict()
+            for name, (stage, loc, typ) in task.items():
+                if stage == specs.Stage.INPUT or (stage == specs.Stage.HINT and encode_hints):
+                    if name == specs.ALGO_IDX_INPUT_NAME and shared_algo_encoder is not None:
+                        enc[name] = shared_algo_encoder
+                    else:
+                        enc[name] = encoders.construct_encoders(stage, loc, typ, hidden_dim, encoder_init, name)
+                        if name == specs.ALGO_IDX_INPUT_NAME:
+                            shared_algo_encoder = enc[name]
+                if stage == specs.Stage.OUTPUT or (stage == specs.Stage.HINT and decode_hints):
+                    dims = nb_dims[i].get(name, 1) if nb_dims is not None else 1
+                    dec[name] = decoders.construct_decoders(loc, typ, hidden_dim, dims, name)
+            self.encoders.append(enc)
+            self.decoders.append(dec)
+
+    def _one_step_pred(self, inputs, hints, hidden, lstm_state, algorithm_index, repred, generator=None):
+        b, n, _ = hidden.shape
+        nodes = hidden.new_zeros(b, n, self.hidden_dim)
+        edges = hidden.new_zeros(b, n, n, self.hidden_dim)
+        graph = hidden.new_zeros(b, self.hidden_dim)
+        adj = torch.eye(n, device=hidden.device).expand(b, n, n)
+        for original in list(inputs) + (list(hints) if self.encode_hints else []):
+            dp = encoders.preprocess(original, n)
+            enc = self.encoders[algorithm_index][dp.name]
+            adj = encoders.accum_adj_mat(dp, adj)
+            edges = encoders.accum_edge_fts(enc, dp, edges)
+            nodes = encoders.accum_node_fts(enc, dp, nodes)
+            graph = encoders.accum_graph_fts(enc, dp, graph)
+        nxt = hidden
+        for _ in range(self.nb_msg_passing_steps):
+            nxt, nxt_edge = self.processor(nodes, edges, graph, adj, nxt)
+        if not repred and self.dropout_prob:
+            keep = torch.rand(nxt.shape, device=nxt.device, generator=generator) >= self.dropout_prob
+            nxt = nxt * keep / (1-self.dropout_prob)
+        if self.lstm is not None:
+            if lstm_state is None:
+                lstm_state = (torch.zeros_like(nxt), torch.zeros_like(nxt))
+            h, c = self.lstm(nxt.reshape(b*n, -1), tuple(x.reshape(b*n, -1) for x in lstm_state))
+            nxt, lstm_state = h.reshape(b, n, -1), (h.reshape(b, n, -1), c.reshape(b, n, -1))
+        h_t = torch.cat((nodes, hidden, nxt), -1)
+        e_t = edges if nxt_edge is None else torch.cat((edges, nxt_edge), -1)
+        hints, outputs = decoders.decode_fts(self.decoders[algorithm_index], self.spec[algorithm_index],
+                                             h_t, adj, e_t, graph, self.processor.inf_bias,
+                                             self.processor.inf_bias_edge, repred, generator)
+        return nxt, outputs, hints, lstm_state
+
+    def _choose_hints(self, truth, previous, first, n, algorithm_index, repred, generator):
+        if not self.encode_hints or not previous:
+            return truth
+        hard = self.hint_repred_mode == 'hard' or (repred and self.hint_repred_mode == 'hard_on_eval')
+        predicted = decoders.postprocess(self.spec[algorithm_index], previous, 0.1, 25, hard)
+        forced = first.bool()
+        if not repred:
+            forced = forced | (torch.rand(first.shape, device=first.device, generator=generator) < self.hint_teacher_forcing)
+        result = []
+        for dp in truth:
+            pred = predicted[dp.name]
+            value = dp.data
+            typ = dp.type_
+            if pred.type_ == specs.Type.SOFT_POINTER:
+                value = F.one_hot(value.long(), n).float()
+                typ = pred.type_
+            data = torch.where(_expand_to(forced, value), value, pred.data)
+            result.append(probing.DataPoint(dp.name, dp.location, typ, data))
+        return result
+
+    def forward(self, features_list, repred=False, algorithm_index=0,
+                return_hints=True, return_all_outputs=False, generator=None):
+        if not isinstance(features_list, list):
+            features_list = [features_list]
+        if algorithm_index == -1:
+            result = None
+            for i, features in enumerate(features_list):
+                result = self.forward(features, repred, i, return_hints, return_all_outputs, generator)
+            return result
+        if len(features_list) != 1:
+            raise ValueError('Pass one task per forward call')
+        features = features_list[0]
+        b, n = _data_dimensions(features)
+        device = features.inputs[0].data.device
+        hidden = torch.zeros(b, n, self.hidden_dim, device=device)
+        lstm_state, previous, outputs = None, {}, {}
+        hint_steps, output_steps, hiddens = [], [], []
+        steps = max(1, int(features.lengths.max().item()) - 1)
+        for i in range(steps):
+            truth = [probing.DataPoint(h.name, h.location, h.type_, h.data[min(i, h.data.shape[0]-1)]) for h in features.hints]
+            first = torch.full((b,), i == 0, device=device, dtype=torch.bool)
+            hints = self._choose_hints(truth, previous, first, n, algorithm_index, repred, generator)
+            hidden, candidate, previous, lstm_state = self._one_step_pred(features.inputs, hints, hidden,
+                                                                       lstm_state, algorithm_index, repred, generator)
+            outputs = candidate if i == 0 else {k: torch.where(_expand_to(features.lengths > i+1, v), v, outputs[k]) for k, v in candidate.items()}
+            hint_steps.append(previous)
+            output_steps.append(outputs)
+            hiddens.append(hidden)
+        if return_all_outputs:
+            outputs = {k: torch.stack([x[k] for x in output_steps]) for k in outputs}
+        result = (outputs, hint_steps if return_hints else None)
+        return (*result, torch.stack(hiddens)) if self.debug else result
+
+
+@dataclass
 class MessagePassingStateChunked:
-  inputs: chex.Array
-  hints: chex.Array
-  is_first: chex.Array
-  hint_preds: chex.Array
-  hiddens: chex.Array
-  lstm_state: Optional[hk.LSTMState]
+    hiddens: torch.Tensor
+    hint_preds: dict
+    inputs: list
+    hints: list
+    is_first: torch.Tensor
+    lstm_state: tuple | None = None
 
-
-class Net(hk.Module):
-  """Building blocks (networks) used to encode and decode messages."""
-
-  def __init__(
-      self,
-      spec: List[_Spec],
-      hidden_dim: int,
-      encode_hints: bool,
-      decode_hints: bool,
-      processor_factory: processors.ProcessorFactory,
-      use_lstm: bool,
-      encoder_init: str,
-      dropout_prob: float,
-      hint_teacher_forcing: float,
-      hint_repred_mode='soft',
-      nb_dims=None,
-      nb_msg_passing_steps=1,
-      debug=False,
-      name: str = 'net',
-  ):
-    """Constructs a `Net`."""
-    super().__init__(name=name)
-
-    self._dropout_prob = dropout_prob
-    self._hint_teacher_forcing = hint_teacher_forcing
-    self._hint_repred_mode = hint_repred_mode
-    self.spec = spec
-    self.hidden_dim = hidden_dim
-    self.encode_hints = encode_hints
-    self.decode_hints = decode_hints
-    self.processor_factory = processor_factory
-    self.nb_dims = nb_dims
-    self.use_lstm = use_lstm
-    self.encoder_init = encoder_init
-    self.nb_msg_passing_steps = nb_msg_passing_steps
-    self.debug = debug
-
-  def _msg_passing_step(self,
-                        mp_state: _MessagePassingScanState,
-                        i: int,
-                        hints: List[_DataPoint],
-                        repred: bool,
-                        lengths: chex.Array,
-                        batch_size: int,
-                        nb_nodes: int,
-                        inputs: _Trajectory,
-                        first_step: bool,
-                        spec: _Spec,
-                        encs: Dict[str, List[hk.Module]],
-                        decs: Dict[str, Tuple[hk.Module]],
-                        return_hints: bool,
-                        return_all_outputs: bool
-                        ):
-    if self.decode_hints and not first_step:
-      assert self._hint_repred_mode in ['soft', 'hard', 'hard_on_eval']
-      hard_postprocess = (self._hint_repred_mode == 'hard' or
-                          (self._hint_repred_mode == 'hard_on_eval' and repred))
-      decoded_hint = decoders.postprocess(spec,
-                                          mp_state.hint_preds,  # pyrefly: ignore[bad-argument-type]
-                                          sinkhorn_temperature=0.1,
-                                          sinkhorn_steps=25,
-                                          hard=hard_postprocess)
-    if repred and self.decode_hints and not first_step:
-      cur_hint = []
-      for hint in decoded_hint:  # pyrefly: ignore[unbound-name]
-        cur_hint.append(decoded_hint[hint])
-    else:
-      cur_hint = []
-      needs_noise = (self.decode_hints and not first_step and
-                     self._hint_teacher_forcing < 1.0)
-      if needs_noise:
-        # For noisy teacher forcing, choose which examples in the batch to force
-        force_mask = jax.random.bernoulli(
-            hk.next_rng_key(), self._hint_teacher_forcing,
-            (batch_size,))
-      else:
-        force_mask = None
-      for hint in hints:
-        hint_data = jnp.asarray(hint.data)[i]
-        _, loc, typ = spec[hint.name]
-        if needs_noise:
-          if (typ == _Type.POINTER and
-              decoded_hint[hint.name].type_ == _Type.SOFT_POINTER):  # pyrefly: ignore[unbound-name]
-            # When using soft pointers, the decoded hints cannot be summarised
-            # as indices (as would happen in hard postprocessing), so we need
-            # to raise the ground-truth hint (potentially used for teacher
-            # forcing) to its one-hot version.
-            hint_data = hk.one_hot(hint_data, nb_nodes)
-            typ = _Type.SOFT_POINTER
-          hint_data = jnp.where(_expand_to(force_mask, hint_data),  # pyrefly: ignore[bad-argument-type]
-                                hint_data,
-                                decoded_hint[hint.name].data)  # pyrefly: ignore[unbound-name]
-        cur_hint.append(
-            probing.DataPoint(
-                name=hint.name, location=loc, type_=typ, data=hint_data))
-
-    hiddens, output_preds_cand, hint_preds, lstm_state = self._one_step_pred(
-        inputs, cur_hint, mp_state.hiddens,
-        batch_size, nb_nodes, mp_state.lstm_state,
-        spec, encs, decs, repred)
-
-    if first_step:
-      output_preds = output_preds_cand
-    else:
-      output_preds = {}
-      for outp in mp_state.output_preds:  # pyrefly: ignore[not-iterable]
-        is_not_done = _is_not_done_broadcast(lengths, i,
-                                             output_preds_cand[outp])
-        output_preds[outp] = is_not_done * output_preds_cand[outp] + (
-            1.0 - is_not_done) * mp_state.output_preds[outp]  # pyrefly: ignore[bad-index]
-
-    new_mp_state = _MessagePassingScanState(
-        hint_preds=hint_preds,
-        output_preds=output_preds,  # pyrefly: ignore[bad-argument-type]
-        hiddens=hiddens,
-        lstm_state=lstm_state)
-    # Save memory by not stacking unnecessary fields
-    accum_mp_state = _MessagePassingScanState(
-        hint_preds=hint_preds if return_hints else None,  # pyrefly: ignore[bad-argument-type]
-        output_preds=output_preds if return_all_outputs else None,  # pyrefly: ignore[bad-argument-type]
-        hiddens=hiddens if self.debug else None, lstm_state=None)  # pyrefly: ignore[bad-argument-type]
-
-    # Complying to jax.scan, the first returned value is the state we carry over
-    # the second value is the output that will be stacked over steps.
-    return new_mp_state, accum_mp_state
-
-  def __call__(self, features_list: List[_Features], repred: bool,
-               algorithm_index: int,
-               return_hints: bool,
-               return_all_outputs: bool):
-    """Process one batch of data.
-
-    Args:
-      features_list: A list of _Features objects, each with the inputs, hints
-        and lengths for a batch o data corresponding to one algorithm.
-        The list should have either length 1, at train/evaluation time,
-        or length equal to the number of algorithms this Net is meant to
-        process, at initialization.
-      repred: False during training, when we have access to ground-truth hints.
-        True in validation/test mode, when we have to use our own
-        hint predictions.
-      algorithm_index: Which algorithm is being processed. It can be -1 at
-        initialisation (either because we are initialising the parameters of
-        the module or because we are intialising the message-passing state),
-        meaning that all algorithms should be processed, in which case
-        `features_list` should have length equal to the number of specs of
-        the Net. Otherwise, `algorithm_index` should be
-        between 0 and `length(self.spec) - 1`, meaning only one of the
-        algorithms will be processed, and `features_list` should have length 1.
-      return_hints: Whether to accumulate and return the predicted hints,
-        when they are decoded.
-      return_all_outputs: Whether to return the full sequence of outputs, or
-        just the last step's output.
-
-    Returns:
-      A 2-tuple with (output predictions, hint predictions)
-      for the selected algorithm.
-    """
-    if algorithm_index == -1:
-      algorithm_indices = range(len(features_list))
-    else:
-      algorithm_indices = [algorithm_index]
-    assert len(algorithm_indices) == len(features_list)
-
-    self.encoders, self.decoders = self._construct_encoders_decoders()
-    self.processor = self.processor_factory(self.hidden_dim)
-
-    # Optionally construct LSTM.
-    if self.use_lstm:
-      self.lstm = hk.LSTM(
-          hidden_size=self.hidden_dim,
-          name='processor_lstm')
-      lstm_init = self.lstm.initial_state
-    else:
-      self.lstm = None
-      lstm_init = lambda x: 0
-
-    for algorithm_index, features in zip(algorithm_indices, features_list):
-      inputs = features.inputs
-      hints = features.hints
-      lengths = features.lengths
-
-      batch_size, nb_nodes = _data_dimensions(features)
-
-      nb_mp_steps = max(1, hints[0].data.shape[0] - 1)
-      hiddens = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
-
-      if self.use_lstm:
-        lstm_state = lstm_init(batch_size * nb_nodes)
-        lstm_state = jax.tree_util.tree_map(
-            lambda x, b=batch_size, n=nb_nodes: jnp.reshape(x, [b, n, -1]),
-            lstm_state)
-      else:
-        lstm_state = None
-
-      mp_state = _MessagePassingScanState(
-          hint_preds=None, output_preds=None,  # pyrefly: ignore[bad-argument-type]
-          hiddens=hiddens, lstm_state=lstm_state)
-
-      # Do the first step outside of the scan because it has a different
-      # computation graph.
-      common_args = dict(
-          hints=hints,
-          repred=repred,
-          inputs=inputs,
-          batch_size=batch_size,
-          nb_nodes=nb_nodes,
-          lengths=lengths,
-          spec=self.spec[algorithm_index],
-          encs=self.encoders[algorithm_index],
-          decs=self.decoders[algorithm_index],
-          return_hints=return_hints,
-          return_all_outputs=return_all_outputs,
-          )
-      mp_state, lean_mp_state = self._msg_passing_step(
-          mp_state,
-          i=0,
-          first_step=True,
-          **common_args)
-
-      # Then scan through the rest.
-      scan_fn = functools.partial(
-          self._msg_passing_step,
-          first_step=False,
-          **common_args)
-
-      output_mp_state, accum_mp_state = hk.scan(
-          scan_fn,
-          mp_state,
-          jnp.arange(nb_mp_steps - 1) + 1,
-          length=nb_mp_steps - 1)
-
-    # We only return the last algorithm's output. That's because
-    # the output only matters when a single algorithm is processed; the case
-    # `algorithm_index==-1` (meaning all algorithms should be processed)
-    # is used only to init parameters.
-    accum_mp_state = jax.tree_util.tree_map(
-        lambda init, tail: jnp.concatenate([init[None], tail], axis=0),
-        lean_mp_state, accum_mp_state)  # pyrefly: ignore[unbound-name]
-
-    def invert(d):
-      """Dict of lists -> list of dicts."""
-      if d:
-        return [dict(zip(d, i)) for i in zip(*d.values())]
-
-    if return_all_outputs:
-      output_preds = {k: jnp.stack(v)
-                      for k, v in accum_mp_state.output_preds.items()}
-    else:
-      output_preds = output_mp_state.output_preds  # pyrefly: ignore[unbound-name]
-    hint_preds = invert(accum_mp_state.hint_preds)
-
-    if self.debug:
-      hiddens = jnp.stack([v for v in accum_mp_state.hiddens])
-      return output_preds, hint_preds, hiddens
-
-    return output_preds, hint_preds
-
-  def _construct_encoders_decoders(self):
-    """Constructs encoders and decoders, separate for each algorithm."""
-    encoders_ = []
-    decoders_ = []
-    enc_algo_idx = None
-    for (algo_idx, spec) in enumerate(self.spec):
-      enc = {}
-      dec = {}
-      for name, (stage, loc, t) in spec.items():
-        if stage == _Stage.INPUT or (
-            stage == _Stage.HINT and self.encode_hints):
-          # Build input encoders.
-          if name == specs.ALGO_IDX_INPUT_NAME:
-            if enc_algo_idx is None:
-              enc_algo_idx = [hk.Linear(self.hidden_dim,
-                                        name=f'{name}_enc_linear')]
-            enc[name] = enc_algo_idx
-          else:
-            enc[name] = encoders.construct_encoders(
-                stage, loc, t, hidden_dim=self.hidden_dim,
-                init=self.encoder_init,
-                name=f'algo_{algo_idx}_{name}')
-
-        if stage == _Stage.OUTPUT or (
-            stage == _Stage.HINT and self.decode_hints):
-          # Build output decoders.
-          dec[name] = decoders.construct_decoders(
-              loc, t, hidden_dim=self.hidden_dim,
-              nb_dims=self.nb_dims[algo_idx][name],  # pyrefly: ignore[unsupported-operation]
-              name=f'algo_{algo_idx}_{name}')
-      encoders_.append(enc)
-      decoders_.append(dec)
-
-    return encoders_, decoders_
-
-  def _one_step_pred(
-      self,
-      inputs: _Trajectory,
-      hints: _Trajectory,
-      hidden: _Array,
-      batch_size: int,
-      nb_nodes: int,
-      lstm_state: Optional[hk.LSTMState],
-      spec: _Spec,
-      encs: Dict[str, List[hk.Module]],
-      decs: Dict[str, Tuple[hk.Module]],
-      repred: bool,
-  ):
-    """Generates one-step predictions."""
-
-    # Initialise empty node/edge/graph features and adjacency matrix.
-    node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
-    edge_fts = jnp.zeros((batch_size, nb_nodes, nb_nodes, self.hidden_dim))
-    graph_fts = jnp.zeros((batch_size, self.hidden_dim))
-    adj_mat = jnp.repeat(
-        jnp.expand_dims(jnp.eye(nb_nodes), 0), batch_size, axis=0)
-
-    # ENCODE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Encode node/edge/graph features from inputs and (optionally) hints.
-    trajectories = [inputs]
-    if self.encode_hints:
-      trajectories.append(hints)
-
-    for trajectory in trajectories:
-      for dp in trajectory:
-        try:
-          dp = encoders.preprocess(dp, nb_nodes)
-          assert dp.type_ != _Type.SOFT_POINTER
-          adj_mat = encoders.accum_adj_mat(dp, adj_mat)
-          encoder = encs[dp.name]
-          edge_fts = encoders.accum_edge_fts(encoder, dp, edge_fts)
-          node_fts = encoders.accum_node_fts(encoder, dp, node_fts)
-          graph_fts = encoders.accum_graph_fts(encoder, dp, graph_fts)
-        except Exception as e:
-          raise Exception(f'Failed to process {dp}') from e
-
-    # PROCESS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    nxt_hidden = hidden
-    for _ in range(self.nb_msg_passing_steps):
-      nxt_hidden, nxt_edge = self.processor(
-          node_fts,
-          edge_fts,
-          graph_fts,
-          adj_mat,
-          nxt_hidden,
-          batch_size=batch_size,
-          nb_nodes=nb_nodes,
-      )
-
-    if not repred:      # dropout only on training
-      nxt_hidden = hk.dropout(hk.next_rng_key(), self._dropout_prob, nxt_hidden)  # pyrefly: ignore[bad-argument-type]
-
-    if self.use_lstm:
-      # lstm doesn't accept multiple batch dimensions (in our case, batch and
-      # nodes), so we vmap over the (first) batch dimension.
-      nxt_hidden, nxt_lstm_state = jax.vmap(self.lstm)(nxt_hidden, lstm_state)  # pyrefly: ignore[bad-argument-type, bad-specialization, not-callable]
-    else:
-      nxt_lstm_state = None
-
-    h_t = jnp.concatenate([node_fts, hidden, nxt_hidden], axis=-1)
-    if nxt_edge is not None:  # pyrefly: ignore[unbound-name]
-      e_t = jnp.concatenate([edge_fts, nxt_edge], axis=-1)
-    else:
-      e_t = edge_fts
-
-    # DECODE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Decode features and (optionally) hints.
-    hint_preds, output_preds = decoders.decode_fts(
-        decoders=decs,
-        spec=spec,
-        h_t=h_t,
-        adj_mat=adj_mat,
-        edge_fts=e_t,
-        graph_fts=graph_fts,
-        inf_bias=self.processor.inf_bias,
-        inf_bias_edge=self.processor.inf_bias_edge,
-        repred=repred,
-    )
-
-    return nxt_hidden, output_preds, hint_preds, nxt_lstm_state
+    def detach(self):
+        return MessagePassingStateChunked(*(tree.map_arrays(lambda x: x.detach(), x)
+            for x in (self.hiddens, self.hint_preds, self.inputs, self.hints,
+                      self.is_first, self.lstm_state)))
 
 
 class NetChunked(Net):
-  """A Net that will process time-chunked data instead of full samples."""
+    """Delay the pending step so cross-chunk targets retain their gradients.
 
-  def _msg_passing_step(self,  # pyrefly: ignore[bad-override]
-                        mp_state: MessagePassingStateChunked,
-                        xs,
-                        repred: bool,
-                        init_mp_state: bool,
-                        batch_size: int,
-                        nb_nodes: int,
-                        spec: _Spec,
-                        encs: Dict[str, List[hk.Module]],
-                        decs: Dict[str, Tuple[hk.Module]],
-                        ):
-    """Perform one message passing step.
-
-    This function is unrolled along the time axis to process a data chunk.
-
-    Args:
-      mp_state: message-passing state. Includes the inputs, hints,
-        beginning-of-sample markers, hint predictions, hidden and lstm state
-        to be used for prediction in the current step.
-      xs: A 3-tuple of with the next timestep's inputs, hints, and
-        beginning-of-sample markers. These will replace the contents of
-        the `mp_state` at the output, in readiness for the next unroll step of
-        the chunk (or the first step of the next chunk). Besides, the next
-        timestep's hints are necessary to compute diffs when `decode_diffs`
-        is True.
-      repred: False during training, when we have access to ground-truth hints.
-        True in validation/test mode, when we have to use our own
-        hint predictions.
-      init_mp_state: Indicates if we are calling the method just to initialise
-        the message-passing state, before the beginning of training or
-        validation.
-      batch_size: Size of batch dimension.
-      nb_nodes: Number of nodes in graph.
-      spec: The spec of the algorithm being processed.
-      encs: encoders for the algorithm being processed.
-      decs: decoders for the algorithm being processed.
-    Returns:
-      A 2-tuple with the next mp_state and an output consisting of
-      hint predictions and output predictions.
+    At time t, consume the stored inputs/hints from t-1 and supervise the
+    prediction against hints[t]. Output supervision occurs on is_last[t].
+    Initial records seed the pending step; singleton records take one step.
     """
-    def _as_prediction_data(hint):
-      if hint.type_ == _Type.POINTER:
-        return hk.one_hot(hint.data, nb_nodes)
-      return hint.data
-
-    nxt_inputs, nxt_hints, nxt_is_first = xs
-    inputs = mp_state.inputs
-    is_first = mp_state.is_first
-    hints = mp_state.hints
-    if init_mp_state:
-      prev_hint_preds = {h.name: _as_prediction_data(h) for h in hints}  # pyrefly: ignore[missing-attribute, not-iterable]
-      hints_for_pred = hints
-    else:
-      prev_hint_preds = mp_state.hint_preds
-      if self.decode_hints:
-        if repred:
-          force_mask = jnp.zeros(batch_size, dtype=bool)
-        elif self._hint_teacher_forcing == 1.0:
-          force_mask = jnp.ones(batch_size, dtype=bool)
-        else:
-          force_mask = jax.random.bernoulli(
-              hk.next_rng_key(), self._hint_teacher_forcing,
-              (batch_size,))
-        assert self._hint_repred_mode in ['soft', 'hard', 'hard_on_eval']
-        hard_postprocess = (
-            self._hint_repred_mode == 'hard' or
-            (self._hint_repred_mode == 'hard_on_eval' and repred))
-        decoded_hints = decoders.postprocess(spec,
-                                             prev_hint_preds,  # pyrefly: ignore[bad-argument-type]
-                                             sinkhorn_temperature=0.1,
-                                             sinkhorn_steps=25,
-                                             hard=hard_postprocess)
-        hints_for_pred = []
-        for h in hints:  # pyrefly: ignore[not-iterable]
-          typ = h.type_  # pyrefly: ignore[missing-attribute]
-          hint_data = h.data  # pyrefly: ignore[missing-attribute]
-          if (typ == _Type.POINTER and
-              decoded_hints[h.name].type_ == _Type.SOFT_POINTER):  # pyrefly: ignore[missing-attribute]
-            hint_data = hk.one_hot(hint_data, nb_nodes)
-            typ = _Type.SOFT_POINTER
-          hints_for_pred.append(probing.DataPoint(
-              name=h.name, location=h.location, type_=typ,  # pyrefly: ignore[missing-attribute]
-              data=jnp.where(_expand_to(is_first | force_mask, hint_data),
-                             hint_data, decoded_hints[h.name].data)))  # pyrefly: ignore[missing-attribute]
-      else:
-        hints_for_pred = hints
-
-    hiddens = jnp.where(is_first[..., None, None], 0.0, mp_state.hiddens)  # pyrefly: ignore[bad-index]
-    if self.use_lstm:
-      lstm_state = jax.tree_util.tree_map(
-          lambda x: jnp.where(is_first[..., None, None], 0.0, x),  # pyrefly: ignore[bad-index]
-          mp_state.lstm_state)
-    else:
-      lstm_state = None
-    hiddens, output_preds, hint_preds, lstm_state = self._one_step_pred(
-        inputs, hints_for_pred, hiddens,  # pyrefly: ignore[bad-argument-type]
-        batch_size, nb_nodes, lstm_state,
-        spec, encs, decs, repred)
-
-    new_mp_state = MessagePassingStateChunked(
-        hiddens=hiddens, lstm_state=lstm_state, hint_preds=hint_preds,
-        inputs=nxt_inputs, hints=nxt_hints, is_first=nxt_is_first)
-    mp_output = _MessagePassingOutputChunked(
-        hint_preds=hint_preds,
-        output_preds=output_preds)
-    return new_mp_state, mp_output
-
-  def __call__(self, features_list: List[_FeaturesChunked],
-               mp_state_list: List[MessagePassingStateChunked],
-               repred: bool, init_mp_state: bool,
-               algorithm_index: int):
-    """Process one chunk of data.
-
-    Args:
-      features_list: A list of _FeaturesChunked objects, each with the
-        inputs, hints and beginning- and end-of-sample markers for
-        a chunk (i.e., fixed time length) of data corresponding to one
-        algorithm. All features are expected
-        to have dimensions chunk_length x batch_size x ...
-        The list should have either length 1, at train/evaluation time,
-        or length equal to the number of algorithms this Net is meant to
-        process, at initialization.
-      mp_state_list: list of message-passing states. Each message-passing state
-        includes the inputs, hints, beginning-of-sample markers,
-        hint prediction, hidden and lstm state from the end of the previous
-        chunk, for one algorithm. The length of the list should be the same
-        as the length of `features_list`.
-      repred: False during training, when we have access to ground-truth hints.
-        True in validation/test mode, when we have to use our own hint
-        predictions.
-      init_mp_state: Indicates if we are calling the network just to initialise
-        the message-passing state, before the beginning of training or
-        validation. If True, `algorithm_index` (see below) must be -1 in order
-        to initialize the message-passing state of all algorithms.
-      algorithm_index: Which algorithm is being processed. It can be -1 at
-        initialisation (either because we are initialising the parameters of
-        the module or because we are intialising the message-passing state),
-        meaning that all algorithms should be processed, in which case
-        `features_list` and `mp_state_list` should have length equal to the
-        number of specs of the Net. Otherwise, `algorithm_index` should be
-        between 0 and `length(self.spec) - 1`, meaning only one of the
-        algorithms will be processed, and `features_list` and `mp_state_list`
-        should have length 1.
-
-    Returns:
-      A 2-tuple consisting of:
-      - A 2-tuple with (output predictions, hint predictions)
-        for the selected algorithm. Each of these has
-        chunk_length x batch_size x ... data, where the first time
-        slice contains outputs for the mp_state
-        that was passed as input, and the last time slice contains outputs
-        for the next-to-last slice of the input features. The outputs that
-        correspond to the final time slice of the input features will be
-        calculated when the next chunk is processed, using the data in the
-        mp_state returned here (see below). If `init_mp_state` is True,
-        we return None instead of the 2-tuple.
-      - The mp_state (message-passing state) for the next chunk of data
-        of the selected algorithm. If `init_mp_state` is True, we return
-        initial mp states for all the algorithms.
-    """
-    if algorithm_index == -1:
-      algorithm_indices = range(len(features_list))
-    else:
-      algorithm_indices = [algorithm_index]
-      assert not init_mp_state  # init state only allowed with all algorithms
-    assert len(algorithm_indices) == len(features_list)
-    assert len(algorithm_indices) == len(mp_state_list)
-
-    self.encoders, self.decoders = self._construct_encoders_decoders()
-    self.processor = self.processor_factory(self.hidden_dim)
-    # Optionally construct LSTM.
-    if self.use_lstm:
-      self.lstm = hk.LSTM(
-          hidden_size=self.hidden_dim,
-          name='processor_lstm')
-      lstm_init = self.lstm.initial_state
-    else:
-      self.lstm = None
-      lstm_init = lambda x: 0
-
-    if init_mp_state:
-      output_mp_states = []
-      for algorithm_index, features, mp_state in zip(
-          algorithm_indices, features_list, mp_state_list):
-        inputs = features.inputs
-        hints = features.hints
-        batch_size, nb_nodes = _data_dimensions_chunked(features)
-
-        if self.use_lstm:
-          lstm_state = lstm_init(batch_size * nb_nodes)
-          lstm_state = jax.tree_util.tree_map(
-              lambda x, b=batch_size, n=nb_nodes: jnp.reshape(x, [b, n, -1]),
-              lstm_state)
-          mp_state.lstm_state = lstm_state
-        # Avoid degraded performance under the new jax.pmap.
-        def _get_first(x):
-          # Handle non-JAX arrays (e.g., numpy arrays) by direct indexing.
-          if not isinstance(x, jax.Array):
-            return x[0]
-          # Scalar arrays have no first element to extract; return as-is.
-          if x.ndim == 0:
-            return x
-          # Arrays without sharding or with SingleDeviceSharding are local;
-          # return them unchanged to avoid unnecessary indexing overhead.
-          if not hasattr(x, 'sharding') or isinstance(
-              x.sharding, jax.sharding.SingleDeviceSharding
-          ):
-            return x
-          # Single-device case: no cross-device copy, safe to index directly.
-          if len(jax.local_devices()) == 1:
-            return x[0]
-          # Fully-replicated arrays have identical data on all shards;
-          # extract from the first addressable shard to avoid copies.
-          if x.sharding.is_fully_replicated:
-            return x.addressable_shards[0].data
-          # For non-replicated sharded arrays, get data from the first shard.
-          # If the shard has a leading dimension of 1 (from the pmap batch
-          # axis), squeeze it out to match the expected shape.
-          shard_data = x.addressable_shards[0].data
-          if shard_data.shape and shard_data.shape[0] == 1:
-            return shard_data.squeeze(0)
-          return shard_data
-
-        mp_state.inputs = jax.tree_util.tree_map(_get_first, inputs)
-        mp_state.hints = jax.tree_util.tree_map(_get_first, hints)
-        mp_state.is_first = jnp.zeros(batch_size, dtype=int)
-        mp_state.hiddens = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
-        next_is_first = jnp.ones(batch_size, dtype=int)
-
-        mp_state, _ = self._msg_passing_step(
-            mp_state,
-            (mp_state.inputs, mp_state.hints, next_is_first),
-            repred=repred,
-            init_mp_state=True,
-            batch_size=batch_size,
-            nb_nodes=nb_nodes,
-            spec=self.spec[algorithm_index],
-            encs=self.encoders[algorithm_index],
-            decs=self.decoders[algorithm_index],
-            )
-        output_mp_states.append(mp_state)
-      return None, output_mp_states
-
-    for algorithm_index, features, mp_state in zip(
-        algorithm_indices, features_list, mp_state_list):
-      inputs = features.inputs
-      hints = features.hints
-      is_first = features.is_first
-      batch_size, nb_nodes = _data_dimensions_chunked(features)
-
-      scan_fn = functools.partial(
-          self._msg_passing_step,
-          repred=repred,
-          init_mp_state=False,
-          batch_size=batch_size,
-          nb_nodes=nb_nodes,
-          spec=self.spec[algorithm_index],
-          encs=self.encoders[algorithm_index],
-          decs=self.decoders[algorithm_index],
-          )
-
-      mp_state, scan_output = hk.scan(
-          scan_fn,
-          mp_state,
-          (inputs, hints, is_first),
-      )
-
-    # We only return the last algorithm's output and state. That's because
-    # the output only matters when a single algorithm is processed; the case
-    # `algorithm_index==-1` (meaning all algorithms should be processed)
-    # is used only to init parameters.
-    return (scan_output.output_preds, scan_output.hint_preds), mp_state  # pyrefly: ignore[unbound-name]
-
-
-def _data_dimensions(features: _Features) -> Tuple[int, int]:
-  """Returns (batch_size, nb_nodes)."""
-  for inp in features.inputs:
-    if inp.location in [_Location.NODE, _Location.EDGE]:
-      return inp.data.shape[:2]
-  assert False
-
-
-def _data_dimensions_chunked(features: _FeaturesChunked) -> Tuple[int, int]:
-  """Returns (batch_size, nb_nodes)."""
-  for inp in features.inputs:
-    if inp.location in [_Location.NODE, _Location.EDGE]:
-      return inp.data.shape[1:3]
-  assert False
-
-
-def _expand_to(x: _Array, y: _Array) -> _Array:
-  while len(y.shape) > len(x.shape):
-    x = jnp.expand_dims(x, -1)
-  return x
-
-
-def _is_not_done_broadcast(lengths, i, tensor):
-  is_not_done = (lengths > i + 1) * 1.0
-  while len(is_not_done.shape) < len(tensor.shape):
-    is_not_done = jnp.expand_dims(is_not_done, -1)
-  return is_not_done
+    def forward(self, features, state=None, repred=False, algorithm_index=0, generator=None):
+        b, n = _data_dimensions_chunked(features)
+        device = features.inputs[0].data.device
+        if state is None:
+            if not features.is_first[0].bool().all():
+                raise ValueError('A new chunk stream must begin with is_first for every lane')
+            state = MessagePassingStateChunked(
+                torch.zeros(b, n, self.hidden_dim, device=device), {},
+                tree.map_arrays(lambda x: x[0], features.inputs),
+                tree.map_arrays(lambda x: x[0], features.hints), features.is_first[0].bool())
+        if state.hiddens.shape[:2] != (b, n):
+            raise ValueError('Reset chunk state before changing graph or batch size')
+        outputs, hints = [], []
+        for t in range(features.is_first.shape[0]):
+            first, last = features.is_first[t].bool(), features.is_last[t].bool()
+            inp = tree.map_arrays(lambda x: x[t], features.inputs)
+            truth = tree.map_arrays(lambda x: x[t], features.hints)
+            select = lambda old, new: torch.where(_expand_to(first, new), new, old)
+            pending_inputs = tree.map_arrays(select, state.inputs, inp)
+            pending_hints = tree.map_arrays(select, state.hints, truth)
+            pending_first = first | state.is_first
+            current = self._choose_hints(pending_hints, state.hint_preds, pending_first,
+                                         n, algorithm_index, repred, generator)
+            hidden = state.hiddens.masked_fill(first[:, None, None], 0)
+            lstm = tree.map_arrays(lambda x: x.masked_fill(first[:, None, None], 0), state.lstm_state)
+            hidden, out, nxt_hints, lstm = self._one_step_pred(
+                pending_inputs, current, hidden, lstm, algorithm_index, repred, generator)
+            # The first hint is given, not predicted. Its transition is deferred
+            # until the next record supplies a target, including across chunks.
+            hidden = hidden.masked_fill((first & ~last)[:, None, None], 0)
+            lstm = tree.map_arrays(lambda x: x.masked_fill((first & ~last)[:, None, None], 0), lstm)
+            outputs.append(out)
+            hints.append(nxt_hints)
+            state = MessagePassingStateChunked(hidden, nxt_hints, inp, truth, first, lstm)
+        stack = lambda sequence: {k: torch.stack([x[k] for x in sequence]) for k in sequence[0]}
+        return (stack(outputs), stack(hints)), state

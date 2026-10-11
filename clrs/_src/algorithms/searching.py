@@ -28,7 +28,7 @@ See "Introduction to Algorithms" 3ed (CLRS3) for more information.
 
 from typing import Tuple, Union
 
-import chex
+from clrs._src.validation import assert_rank
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
@@ -42,7 +42,7 @@ _Out = Tuple[int, probing.ProbesDict]
 def minimum(A: _Array) -> _Out:
   """Minimum."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
   probes = probing.initialize(specs.SPECS['minimum'])
 
   A_pos = np.arange(A.shape[0])
@@ -91,7 +91,7 @@ def minimum(A: _Array) -> _Out:
 def binary_search(x: _Numeric, A: _Array) -> _Out:
   """Binary search."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
   probes = probing.initialize(specs.SPECS['binary_search'])
 
   T_pos = np.arange(A.shape[0])
@@ -154,7 +154,7 @@ def quickselect(
 ) -> _Out:
   """Quickselect (Hoare, 1961)."""
 
-  chex.assert_rank(A, 1)
+  assert_rank(A, 1)
 
   def partition(A, A_pos, p, r, target, probes):
     x = A[r]

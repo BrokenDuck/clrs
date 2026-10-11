@@ -27,7 +27,7 @@ See "Introduction to Algorithms" 3ed (CLRS3) for more information.
 
 from typing import Tuple
 
-import chex
+from clrs._src.validation import assert_rank
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
@@ -42,7 +42,7 @@ _ALPHABET_SIZE = 4
 def naive_string_matcher(T: _Array, P: _Array) -> _Out:
   """Naive string matching."""
 
-  chex.assert_rank([T, P], 1)
+  assert_rank([T, P], 1)
   probes = probing.initialize(specs.SPECS['naive_string_matcher'])
 
   T_pos = np.arange(T.shape[0])
@@ -114,7 +114,7 @@ def naive_string_matcher(T: _Array, P: _Array) -> _Out:
 def kmp_matcher(T: _Array, P: _Array) -> _Out:
   """Knuth-Morris-Pratt string matching (Knuth et al., 1977)."""
 
-  chex.assert_rank([T, P], 1)
+  assert_rank([T, P], 1)
   probes = probing.initialize(specs.SPECS['kmp_matcher'])
 
   T_pos = np.arange(T.shape[0])

@@ -1,257 +1,179 @@
-# The CLRS Algorithmic Reasoning Benchmark
+# CLRS in PyTorch
 
-Learning representations of algorithms is an emerging area of machine learning,
-seeking to bridge concepts from neural networks with classical algorithms. The
-CLRS Algorithmic Reasoning Benchmark (CLRS) consolidates and extends previous
-work toward evaluation algorithmic reasoning by providing a suite of
-implementations of classical algorithms. These algorithms have been selected
-from the third edition of the standard *Introduction to Algorithms* by Cormen,
-Leiserson, Rivest and Stein.
+A PyTorch fork of [google-deepmind/clrs](https://github.com/google-deepmind/clrs),
+with published CLRS-30 dataset loading, the original NumPy reference algorithms,
+and an additional hinted min-plus repeated-squaring APSP task.
+The upstream base revision is recorded in `UPSTREAM_COMMIT`.
+Apache-2.0 licensing and upstream attribution are preserved.
 
-## Getting started
+## Installation
 
-The CLRS Algorithmic Reasoning Benchmark can be installed with pip, either from
-PyPI:
+Python 3.12+ is supported; the parent project uses Python 3.14.
 
-```shell
-pip install dm-clrs
+```bash
+pip install -e '.[test]'
+OMP_NUM_THREADS=1 pytest -q
 ```
 
-or directly from GitHub (updated more frequently):
+The runtime uses PyTorch and NumPy. JAX, Haiku, Optax, Chex, TensorFlow, and
+TensorFlow Datasets are not dependencies. The standalone `tfrecord` package
+supplies the protobuf definitions for reading the published archive.
 
-```shell
-pip install git+https://github.com/google-deepmind/clrs.git
-```
-
-You may prefer to install it in a virtual environment if any requirements
-clash with your Python installation:
-
-```shell
-python3 -m venv clrs_env
-source clrs_env/bin/activate
-pip install git+https://github.com/google-deepmind/clrs.git
-```
-
-Once installed you can run our example baseline model:
-
-```shell
-python3 -m clrs.examples.run
-```
-
-If this is the first run of the example, the dataset will be downloaded and
-stored in `--dataset_path` (default '/tmp/CLRS30').
-Alternatively, you can also download and extract https://storage.googleapis.com/dm-clrs/CLRS30_v1.0.0.tar.gz
-
-## Algorithms as graphs
-
-CLRS implements the selected algorithms in an idiomatic way, which aligns as
-closely as possible to the original CLRS 3ed pseudocode. By controlling the
-input data distribution to conform to the preconditions we are able to
-automatically generate input/output pairs. We additionally provide trajectories
-of "hints" that expose the internal state of each algorithm, to both optionally
-simplify the learning challenge and to distinguish between different algorithms
-that solve the same overall task (e.g. sorting).
-
-In the most generic sense, algorithms can be seen as manipulating sets of
-objects, along with any relations between them (which can themselves be
-decomposed into binary relations). Accordingly, we study all of the algorithms
-in this benchmark using a graph representation. In the event that objects obey a
-more strict ordered structure (e.g. arrays or rooted trees), we impose this
-ordering through inclusion of predecessor links.
-
-## How it works
-
-For each algorithm, we provide a canonical set of *train*, *eval* and *test*
-trajectories for benchmarking out-of-distribution generalization.
-
-|       | Trajectories    | Problem Size |
-|-------|-----------------|--------------|
-| Train | 1000            | 16           |
-| Eval  | 32 x multiplier | 16           |
-| Test  | 32 x multiplier | 64           |
-
-
-Here, "problem size" refers to e.g. the length of an array or number of nodes in
-a graph, depending on the algorithm. "multiplier" is an algorithm-specific
-factor that increases the number of available *eval* and *test* trajectories
-to compensate for paucity of evaluation signals. "multiplier" is 1 for all
-algorithms except:
-
-- Maximum subarray (Kadane), for which "multiplier" is 32.
-- Quick select, minimum, binary search, string matchers (both naive and KMP),
-and segment intersection, for which "multiplier" is 64.
-
-The trajectories can be used like so:
+## Dataset access
 
 ```python
-train_ds, num_samples, spec = clrs.create_dataset(
-      folder='/tmp/CLRS30', algorithm='bfs',
-      split='train', batch_size=32)
+import clrs
 
-for i, feedback in enumerate(train_ds.as_numpy_iterator()):
-  if i == 0:
-    model.init(feedback.features, initial_seed)
-  loss = model.feedback(rng_key, feedback)
+# Exact published records; downloads the official ~86 MB archive on first use.
+loader, count, spec = clrs.create_dataset(
+    './data/clrs', 'floyd_warshall', 'train', batch_size=8,
+    source='published')
+feedback = next(iter(loader))
+
+# New trajectories with reproducible sampling and a provenance-keyed NPZ cache.
+loader, count, spec = clrs.create_dataset(
+    './data/clrs', 'min_plus_apsp', 'train', batch_size=8,
+    source='generated', num_samples=1000, length=16, seed=1)
 ```
 
-Here, `feedback` is a `namedtuple` with the following structure:
+`create_dataset` returns `(torch.utils.data.DataLoader, count, spec)`. Loaders
+are finite; iterate with ordinary Python, restarting each epoch. Training
+loaders shuffle by default; validation/test do not. `loader_seed` controls
+shuffle order, while `seed` controls generated examples. `num_workers` supports
+parallel loading without duplicating samples. One dataset has one graph size;
+create separate loaders for different sizes.
+
+`Feedback(features, outputs)` and `Features(inputs, hints, lengths)` retain
+CLRS metadata. Each `DataPoint` has `name`, `location`, `type_`, and `data`.
+Tensor inputs/outputs are `[batch, ...]`; hints are `[time, batch, ...]` and
+padded within a batch. Integer `lengths` excludes padding. Numeric precision is
+retained in the loader; model encoders use float32 and pointers become integer
+indices. Use `clrs.to_torch(feedback, device)` to transfer a batch. Custom
+DataLoaders should use `clrs.collate_feedback`.
+
+For direct NumPy sampling, `clrs.build_sampler(name, num_samples, seed=...,
+length=...)` remains available, including `num_samples=-1` for online sampling.
+All original tasks remain available. `CLRS_30_ALGS` stays unchanged; select
+`min_plus_apsp` explicitly.
+
+Published data uses the archive's values, feature shapes, and dtypes. In
+particular, TFRecord FloatList values have float32 storage precision even when
+metadata declares float64. Published quickselect uses its historical spec,
+without the later `pivot` hint: always use the spec returned by the loader.
+Generated data uses the current spec. No missing published hints are invented.
+`download=False` requires already-extracted records; `source='generated'` never
+substitutes for published data. Generated caches include split, seed, size,
+sampler options, format version, and upstream revision; bump `CACHE_VERSION`
+when changing generation semantics. Published records are indexed by file offset
+and read on demand. The downloaded archive is retained, and only requested task
+splits are extracted.
+
+## Min-plus APSP and hints
+
+`clrs.algorithms.min_plus_apsp(A)` returns `(Pi, probes)`. It implements the
+[min-plus repeated-squaring algorithm in MIT lecture 11](https://ocw.mit.edu/courses/6-046j-design-and-analysis-of-algorithms-spring-2015/312f4a419009b58f8147b75975db4347_MIT6_046JS15_lec11.pdf).
+Starting with paths of at most one edge, each round computes
+`D_new[i,j] = min_k(D_old[i,k] + D_old[k,j])` using immutable previous-round
+matrices. The path bound doubles until it covers `n-1` edges. Runtime is
+O(n³ log n); the reduction uses O(n²) scratch space and the hints occupy
+O(n² log n).
+
+The input/output contract follows CLRS Floyd–Warshall:
+
+| Stage | Probes |
+| --- | --- |
+| Input | `pos`: node scalar; `A`: edge weights; `adj`: edge mask |
+| Hint | `Pi_h`: edge predecessor pointer; `D`: edge distance; `msk`: reachability; `m`: graph scalar path bound |
+| Output | `Pi`: edge predecessor pointer |
+
+One initialization snapshot is followed by one snapshot per complete square,
+including the final state. The number of hints is
+`1 + ceil(log2(max(1, n-1)))`. No inner-loop hint steps are emitted.
+`Pi[i,j]` is the predecessor of j on a shortest path from i. Unreachable pairs
+and diagonals retain the source index i. Existing paths win ties; otherwise
+intermediate vertices are considered in ascending order.
+
+Off-diagonal zero means no edge, as in CLRS Floyd–Warshall. The diagonal distance
+is zero. Internally unreachable distances are infinite; probes instead use zero
+plus `msk=0`, so neural inputs remain finite. Negative edges are supported under
+the precondition of no negative cycles; general negative-cycle detection is not
+provided. Default sampling reuses Floyd–Warshall's nonnegative, undirected graph
+distribution; direct algorithm calls also support directed graphs. Empty,
+non-square, nonfinite matrices and negative self-loops are rejected.
+
+## Models and training
 
 ```python
-Feedback = collections.namedtuple('Feedback', ['features', 'outputs'])
-Features = collections.namedtuple('Features', ['inputs', 'hints', 'lengths'])
+feedback = next(iter(loader))
+model = clrs.models.BaselineModel(
+    spec, feedback, clrs.get_processor_factory('pgn'),
+    hidden_dim=32, encode_hints=True, decode_hints=True,
+    hint_teacher_forcing=0.5, device='cpu', seed=0)
+loss = model.feedback(feedback)
+predictions, predicted_hints = model.predict(feedback.features)
+metrics = clrs.evaluate(feedback.outputs, predictions)
 ```
 
-where the content of `Features` can be used for training and `outputs` is
-reserved for evaluation. Each field of the tuple is an `ndarray` with a leading
-batch dimension. Because `hints` are provided for the full algorithm trajectory,
-these contain an additional time dimension padded up to the maximum length
-`max(T)` of any trajectory within the dataset. The `lengths` field specifies the
-true length `t <= max(T)` for each trajectory, which can be used e.g. for loss
-masking.
+Pass lists of specs and dummy batches for multi-task learning, then select
+`algorithm_index` in `feedback`, `predict`, or `forward`. Task encoders and
+decoders are separate; the processor is shared. `forward` exposes differentiable
+raw logits for custom training loops. For explicit PyTorch optimization, call
+`model.loss(feedback)` and use its total and per-probe losses.
 
-The `examples` directory contains a full working Graph Neural Network (GNN)
-example using JAX and the DeepMind JAX Ecosystem of libraries. It allows
-training of multiple algorithms on a single processor, as described in
-["A Generalist Neural Algorithmic Learner"](https://arxiv.org/abs/2209.11142).
+All 19 upstream factory options are implemented: Deep Sets, GAT/GATv2 with
+masked or full adjacency, both memory networks, MPNN, PGN, masked PGN, and
+upstream gated/triplet variants. D2 GATv2 is available as a class. The memory
+network retains the original discrete embedding design; feature-to-index
+conversion is not differentiable. This port does not claim numerical identity
+between framework initializers or reproduce published benchmark scores.
 
-## What we provide
+Training supports optional LSTM state, dropout, noisy teacher forcing, hard/soft
+hint feedback, processor freezing, gradient clipping, and checkpointed Adam
+state. Evaluation consumes only the initial ground-truth hint; subsequent hints
+are autoregressive. Trajectory lengths still determine the number of steps,
+as in CLRS. PyTorch generators replace JAX random keys; calls no longer accept
+an RNG key as their first argument. `save_model()` / `restore_model()` use torch
+state dictionaries and include optimizer and generator state. JAX checkpoints
+are not compatible.
 
-### Algorithms
-
-Our initial CLRS-30 benchmark includes the following 30 algorithms. We aim to
-support more algorithms in the future.
-
-- Sorting
-  - Insertion sort
-  - Bubble sort
-  - Heapsort (Williams, 1964)
-  - Quicksort (Hoare, 1962)
-- Searching
-  - Minimum
-  - Binary search
-  - Quickselect (Hoare, 1961)
-- Divide and conquer
-  - Maximum subarray (Kadane's variant) (Bentley, 1984)
-- Greedy
-  - Activity selection (Gavril, 1972)
-  - Task scheduling (Lawler, 1985)
-- Dynamic programming
-  - Matrix chain multiplication
-  - Longest common subsequence
-  - Optimal binary search tree (Aho et al., 1974)
-- Graphs
-  - Depth-first search (Moore, 1959)
-  - Breadth-first search (Moore, 1959)
-  - Topological sorting (Knuth, 1973)
-  - Articulation points
-  - Bridges
-  - Kosaraju's strongly connected components algorithm (Aho et al., 1974)
-  - Kruskal's minimum spanning tree algorithm (Kruskal, 1956)
-  - Prim's minimum spanning tree algorithm (Prim, 1957)
-  - Bellman-Ford algorithm for single-source shortest paths (Bellman, 1958)
-  - Dijkstra's algorithm for single-source shortest paths (Dijkstra et al., 1959)
-  - Directed acyclic graph single-source shortest paths
-  - Floyd-Warshall algorithm for all-pairs shortest-paths (Floyd, 1962)
-- Strings
-  - Naïve string matching
-  - Knuth-Morris-Pratt (KMP) string matcher (Knuth et al., 1977)
-- Geometry
-  - Segment intersection
-  - Graham scan convex hull algorithm (Graham, 1972)
-  - Jarvis' march convex hull algorithm (Jarvis, 1973)
-
-### Baselines
-
-Models consist of a *processor* and a number of *encoders* and *decoders*.
-We provide JAX implementations of the following GNN baseline processors:
-
-- Deep Sets (Zaheer et al., NIPS 2017)
-- End-to-End Memory Networks (Sukhbaatar et al., NIPS 2015)
-- Graph Attention Networks (Veličković et al., ICLR 2018)
-- Graph Attention Networks v2 (Brody et al., ICLR 2022)
-- Message-Passing Neural Networks (Gilmer et al., ICML 2017)
-- Pointer Graph Networks (Veličković et al., NeurIPS 2020)
-
-If you want to implement a new processor, the easiest way is to add
-it in the `processors.py` file and make it available through the
-`get_processor_factory` method there. A processor should have a `__call__`
-method like this:
-
-```
-__call__(self,
-         node_fts, edge_fts, graph_fts,
-         adj_mat, hidden,
-         nb_nodes, batch_size)
+```bash
+python -m clrs.examples.run --algorithms min_plus_apsp --steps 100
+python -m clrs.examples.run --algorithms bfs,min_plus_apsp --processor-type triplet_pgn --steps 100
+python -m clrs.examples.run --algorithms floyd_warshall --source published --steps 100
 ```
 
-where `node_fts`, `edge_fts` and `graph_fts` will be float arrays of shape
-`batch_size` x `nb_nodes` x H, `batch_size` x `nb_nodes` x `nb_nodes` x H,
-and `batch_size` x H with encoded features for
-nodes, edges and graph respectively, `adj_mat` a
-`batch_size` x `nb_nodes` x `nb_nodes` boolean
-array of connectivity built from hints and inputs, and `hidden` a
-`batch_size` x `nb_nodes` x H float array with the previous-step outputs
-of the processor. The method should return a `batch_size` x `nb_nodes` x H
-float array.
+The example reports validation and larger-graph test metrics and writes a
+checkpoint. Use `--device cuda` when available. `--num-samples`, `--eval-samples`,
+`--train-length`, and `--test-length` customize generated datasets; published
+splits retain their fixed examples. `--restore` resumes weights and optimizer;
+data iterator position and live chunk state restart.
 
-For more fundamentally different baselines, it is necessary to create a new
-class that extends the Model API (as found within `clrs/_src/model.py`).
-`clrs/_src/baselines.py` provides one example of how this can be done.
+For truncated BPTT, `create_chunked_dataset(..., chunk_length=...)` returns a
+repeating iterator and spec; `BaselineModelChunked` consumes its feedback.
+Inputs, hints, and outputs all have `[time, batch, ...]` axes, with `is_first`
+and `is_last` markers. Pending transitions cross chunk boundaries before their
+losses are computed, retaining training gradients at those boundaries. Hidden
+states are detached between chunks and reset at sample boundaries. Call
+`reset_state()` when starting a new stream. The CLI enables this with
+`--chunk-length`. Direct `chunkify` drops incomplete final chunks of finite
+streams; the dataset wrapper repeats full batches.
 
-## Creating your own dataset
+CLRS-Text formatters and the Hugging Face generator remain available. The text
+creation utility now returns a PyTorch IterableDataset of Python dictionaries.
 
-We provide a `tensorflow_dataset` generator class in `dataset.py`. This file can
-be modified to generate different versions of the available algorithms, and it
-can be built by using `tfds build` after following the installation instructions
-at https://www.tensorflow.org/datasets.
+## Validation
 
-Alternatively, you can generate samples without going through `tfds` by
-instantiating samplers with the `build_sampler` method in
-`clrs/_src/samplers.py`, like so:
+The tests cover all reference algorithms, sampler determinism, published record
+and cache decoding, all processors, full/chunked losses, future-hint isolation,
+checkpoint restoration, unused multi-task heads, and a tiny APSP overfit run.
+Min-plus tests check bounded-path distances and reconstructed predecessor paths,
+including ties, disconnected graphs, signed edges, and singleton graphs.
 
+To additionally check real published records after extracting them:
+
+```bash
+CLRS_PUBLISHED_TEST_DIR=/path/to/data OMP_NUM_THREADS=1 pytest -q
 ```
-sampler, spec = clrs.build_sampler(
-    name='bfs',
-    seed=42,
-    num_samples=1000,
-    length=16)
-
-def _iterate_sampler(batch_size):
-  while True:
-    yield sampler.next(batch_size)
-
-for feedback in _iterate_sampler(batch_size=32):
-  ...
-
-```
-
-Most recently, we are offering [**CLRS-Text**](https://github.com/google-deepmind/clrs/tree/master/clrs/_src/clrs_text),
-a text-based variant of the benchmark suitable for training and evaluating the algorithmic reasoning
-capabilities of language models. Please see the relevant subfolder for a
-dedicated README file.
-
-You may also see the [companion paper](https://arxiv.org/abs/2406.04229) on
-CLRS-Text.
-
-## Adding new algorithms
-
-Adding a new algorithm to the task suite requires the following steps:
-
-1. Determine the input/hint/output specification of your algorithm, and include
-it within the `SPECS` dictionary of `clrs/_src/specs.py`.
-2. Implement the desired algorithm in an abstractified form. Examples of this
-can be found throughout the `clrs/_src/algorithms/` folder.
-  - Choose appropriate moments within the algorithm’s execution to create probes
-    that capture the inputs, outputs and all intermediate state (using
-    the `probing.push` function).
-  - Once generated, probes must be formatted using the `probing.finalize`
-    method, and should be returned together with the algorithm output.
-3. Implement an appropriate input data sampler for your algorithm,
-and include it in the `SAMPLERS` dictionary within `clrs/_src/samplers.py`.
-
-Once the algorithm has been added in this way, it can be accessed with the
-`build_sampler` method, and will also be incorporated to the dataset if
-regenerated with the generator class in `dataset.py`, as described above.
 
 ## Citation
 

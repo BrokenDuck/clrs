@@ -28,7 +28,7 @@ See "Introduction to Algorithms" 3ed (CLRS3) for more information.
 
 from typing import Tuple
 
-import chex
+from clrs._src.validation import assert_rank
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
@@ -41,7 +41,7 @@ _Out = Tuple[_Array, probing.ProbesDict]
 def matrix_chain_order(p: _Array) -> _Out:
   """Matrix-chain multiplication."""
 
-  chex.assert_rank(p, 1)
+  assert_rank(p, 1)
   probes = probing.initialize(specs.SPECS['matrix_chain_order'])
 
   A_pos = np.arange(p.shape[0])
@@ -94,7 +94,7 @@ def matrix_chain_order(p: _Array) -> _Out:
 
 def lcs_length(x: _Array, y: _Array) -> _Out:
   """Longest common subsequence."""
-  chex.assert_rank([x, y], 1)
+  assert_rank([x, y], 1)
   probes = probing.initialize(specs.SPECS['lcs_length'])
 
   x_pos = np.arange(x.shape[0])
@@ -170,7 +170,7 @@ def lcs_length(x: _Array, y: _Array) -> _Out:
 def optimal_bst(p: _Array, q: _Array) -> _Out:
   """Optimal binary search tree (Aho et al., 1974)."""
 
-  chex.assert_rank([p, q], 1)
+  assert_rank([p, q], 1)
   probes = probing.initialize(specs.SPECS['optimal_bst'])
 
   A_pos = np.arange(q.shape[0])

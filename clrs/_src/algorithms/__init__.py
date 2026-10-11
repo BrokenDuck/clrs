@@ -56,3 +56,5 @@ from clrs._src.algorithms.sorting import quicksort
 
 from clrs._src.algorithms.strings import naive_string_matcher
 from clrs._src.algorithms.strings import kmp_matcher
+
+from clrs._src.algorithms.graphs import min_plus_apsp

@@ -16,13 +16,14 @@
 """Model base classes and utilities."""
 
 from typing import Dict, List, Tuple
-import chex
+import torch
+from clrs._src import tree
 from clrs._src import probing
 from clrs._src import specs
 import numpy as np
 
 
-_Array = chex.Array
+_Array = np.ndarray | torch.Tensor
 Result = Dict[str, probing.DataPoint]
 
 
@@ -103,6 +104,11 @@ def evaluate_hints(
     hint_preds: List[Result],
 ) -> Dict[str, _Array]:
   """Evaluate hint predictions."""
+  hints = tree.map_arrays(_numpy, hints)
+  hint_preds = tree.map_arrays(_numpy, hint_preds)
+  lengths = _numpy(lengths)
+  if not hint_preds:
+    return {}
   evals = {}
   hints = _reduce_permutations_tuple(hints)
   hint_preds = [_reduce_permutations_dict(h) for h in hint_preds]
@@ -127,6 +133,8 @@ def evaluate(
     predictions: Result,
 ) -> Dict[str, float]:
   """Evaluate output predictions."""
+  outputs = tree.map_arrays(_numpy, outputs)
+  predictions = tree.map_arrays(_numpy, predictions)
   evals = {}
   outputs = _reduce_permutations_tuple(outputs)
   predictions = _reduce_permutations_dict(predictions)
@@ -197,6 +205,12 @@ _EVAL_FN = {
         _eval_one,
     specs.Type.CATEGORICAL:
         _eval_one,
+    specs.Type.SHOULD_BE_PERMUTATION:
+        lambda pred, truth: np.mean((pred == truth) * 1.0),
     specs.Type.POINTER:
         lambda pred, truth: np.mean((pred == truth) * 1.0),
 }
+
+
+def _numpy(x):
+  return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)

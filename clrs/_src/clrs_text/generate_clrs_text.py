@@ -44,10 +44,9 @@ from absl import flags
 from absl import logging
 from clrs._src import samplers as clrs_samplers
 from clrs._src.clrs_text import clrs_utils
-import jax
 from ml_collections import config_dict
 from ml_collections import config_flags
-import tensorflow as tf
+from torch.utils.data import IterableDataset, get_worker_info
 import tqdm
 
 _DEFAULT_TRAIN_ALGOS_AND_LENGTHS = {
@@ -154,51 +153,6 @@ _NUM_DECIMALS_IN_FLOAT = flags.DEFINE_integer(
 )
 
 
-CLRS_SAMPLE_SPEC = {
-    'prompt': tf.TensorSpec(shape=(), dtype=tf.string),
-    'references': tf.TensorSpec(shape=[None], dtype=tf.string),
-    'auxiliary': {
-        'length': tf.TensorSpec(shape=(), dtype=tf.int32),
-        'seed': tf.TensorSpec(shape=(), dtype=tf.int32),
-        'use_hints': tf.TensorSpec(shape=(), dtype=tf.bool),
-    },
-}
-
-CLRS_TF_TENSORS_CONVERTERS = {
-    'prompt': lambda x: x.numpy().decode('utf-8'),
-    'references': lambda x: [y.numpy().decode('utf-8') for y in x],
-    'auxiliary': {
-        'length': lambda x: x.numpy().tolist(),
-        'seed': lambda x: x.numpy().tolist(),
-        'use_hints': lambda x: x.numpy().tolist(),
-    },
-}
-
-
-def _convert_to_basic_types(
-    sample: dict[str, Any],
-    converters: dict[str, Callable[[Any], Any]],
-) -> dict[str, Any]:
-  """Converts a sample to basic types from tf.Tensor.
-
-  Args:
-    sample: The sample to convert.
-    converters: The converters to use.
-
-  Returns:
-    The converted sample.
-  """
-  vals, sample_tree = jax.tree.flatten(sample)
-  converters, converters_tree = jax.tree.flatten(converters)  # pyrefly: ignore[bad-assignment]
-  if sample_tree != converters_tree:
-    raise ValueError(
-        f'Sample tree {sample_tree} and converters tree {converters_tree} '
-        'do not match.'
-    )
-  converted_vals = [converter(val) for val, converter in zip(vals, converters)]  # pyrefly: ignore[not-callable]
-  return jax.tree.unflatten(sample_tree, converted_vals)
-
-
 def get_dataset_config(
     algo_name: str,
     length: int,
@@ -274,41 +228,32 @@ def sample_generator(
 
 def generate_clrs_algo_dataset(
     config: config_dict.ConfigDict,
-) -> tf.data.Dataset:
+) -> IterableDataset:
   """Generates a dataset of CLRS samples.
 
   Args:
     config: The config for the dataset.
 
   Returns:
-    A tf.data.Dataset of CLRS samples.
+    An IterableDataset of CLRS samples.
   """
-  sampler, _ = clrs_samplers.build_sampler(
-      name=config.algo_name,
-      seed=config.seed,
-      num_samples=-1,  # data is generated on the fly.
-      length=config.length,
-      track_max_steps=False,
-      truncate_decimals=config.num_decimals_in_float,
-  )
+  return CLRSTextDataset(config)
 
-  generator_fn = functools.partial(
-      sample_generator,
-      config.algo_name,
-      config.number_of_samples,
-      config.length,
-      config.use_hints,
-      sampler,
-      config.seed,
-  )
 
-  dataset = tf.data.Dataset.from_generator(
-      generator_fn,
-      output_signature=CLRS_SAMPLE_SPEC,
-  )
+class CLRSTextDataset(IterableDataset):
+  def __init__(self, config):
+    self.config = config
 
-  # Return the dataset.
-  return dataset
+  def __iter__(self):
+    c = self.config
+    sampler, _ = clrs_samplers.build_sampler(
+        c.algo_name, num_samples=-1, seed=c.seed, length=c.length,
+        track_max_steps=False, truncate_decimals=c.num_decimals_in_float)
+    worker = get_worker_info()
+    for index, sample in enumerate(sample_generator(c.algo_name, c.number_of_samples,
+        c.length, c.use_hints, sampler, c.seed)):
+      if worker is None or index % worker.num_workers == worker.id:
+        yield sample
 
 
 def _update_generation_params(
@@ -431,7 +376,7 @@ def main(_: Sequence[str]) -> None:
       dataset = generate_clrs_algo_dataset(config)
       samples.extend(
           [
-              _convert_to_basic_types(sample, CLRS_TF_TENSORS_CONVERTERS)  # pyrefly: ignore[bad-argument-type]
+              sample  # pyrefly: ignore[bad-argument-type]
               for sample in dataset
           ],
       )
