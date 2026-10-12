@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.9.5,<0.10.0"]
+build-backend = "uv_build"
 
 [project]
 name = "dm-clrs"
@@ -9,6 +9,7 @@ description = "PyTorch port of the CLRS Algorithmic Reasoning Benchmark"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
   "absl-py>=2.1", "attrs>=24.2", "numpy>=1.26", "torch>=2.2",
   "tfrecord>=1.14.4", "scipy>=1.11", "ml-collections>=0.1.1", "tqdm>=4.66",
@@ -21,11 +22,46 @@ test = ["pytest>=8"]
 Repository = "https://github.com/BrokenDuck/clrs"
 Upstream = "https://github.com/google-deepmind/clrs"
 
-[tool.setuptools.packages.find]
-include = ["clrs*"]
-
-[tool.setuptools.package-data]
-clrs = ["UPSTREAM_COMMIT", "py.typed"]
+[tool.uv.build-backend]
+module-name = "clrs"
+source-include = ["UPSTREAM_COMMIT", "tests/**", "examples/**"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
 python_files = ["*_test.py", "test_*.py"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 80
+indent-width = 2
+src = ["src"]
+extend-exclude = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# These modules intentionally re-export the public API.
+"src/clrs/__init__.py" = ["F401"]
+"src/clrs/_src/algorithms/__init__.py" = ["F401"]
+"src/clrs/_src/clrs_text/__init__.py" = ["F401"]
+"src/clrs/models.py" = ["F401"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ty.environment]
+python-version = "3.12"
+root = ["src"]
+
+[tool.ty.src]
+include = ["src", "tests", "examples"]
+exclude = ["**/*.ipynb"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.17.0",
+    "ty>=0.0.86",
+]

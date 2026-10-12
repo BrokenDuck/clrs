@@ -9,15 +9,60 @@ Apache-2.0 licensing and upstream attribution are preserved.
 ## Installation
 
 Python 3.12+ is supported; the parent project uses Python 3.14.
+From a standalone checkout:
 
 ```bash
-pip install -e '.[test]'
-OMP_NUM_THREADS=1 pytest -q
+uv sync --extra test
+OMP_NUM_THREADS=1 uv run --extra test pytest -q
+uv build
 ```
+
+Packaging uses `uv_build`, with application code in `src/clrs/`, tests in
+`tests/`, and runnable examples in `examples/`. Install the package before
+running tests or examples. Tests and examples are included in the source
+distribution but not the installed wheel. Standard
+PEP 517 frontends, including `pip install -e '.[test]'`, are also supported.
+When checked out in the graph-lt workspace, use `uv sync` at the workspace root
+and `uv build --package dm-clrs` to build this package. The workspace shares one
+lockfile and installs CLRS editable; its Python requirement is the intersection
+of all members' requirements (currently Python 3.14+).
+
+From the workspace root, run tests with
+`uv run pytest -c external/clrs/pyproject.toml external/clrs/tests -q`
+and examples with `uv run python external/clrs/examples/run.py --help`.
 
 The runtime uses PyTorch and NumPy. JAX, Haiku, Optax, Chex, TensorFlow, and
 TensorFlow Datasets are not dependencies. The standalone `tfrecord` package
 supplies the protobuf definitions for reading the published archive.
+
+## Development checks
+
+[Ruff](https://docs.astral.sh/ruff/configuration/) handles linting and formatting;
+[ty](https://docs.astral.sh/ty/configuration/) handles type checking. Both are
+configured in `pyproject.toml` and installed by the `dev` dependency group.
+Checks cover source code, tests, and examples; archived notebooks are excluded.
+The formatter retains the upstream two-space indentation and single quotes.
+
+From a standalone checkout:
+
+```bash
+uv sync
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check
+```
+
+From the graph-lt workspace root:
+
+```bash
+uv run --package dm-clrs ruff check external/clrs
+uv run --package dm-clrs ruff format --check external/clrs
+uv run --package dm-clrs ty check --project external/clrs
+```
+
+Use `ruff format` without `--check` to apply formatting. Existing lint, formatting,
+and type diagnostics remain visible; introducing these tools does not establish
+a clean baseline for the legacy code.
 
 ## Dataset access
 
@@ -137,9 +182,9 @@ state dictionaries and include optimizer and generator state. JAX checkpoints
 are not compatible.
 
 ```bash
-python -m clrs.examples.run --algorithms min_plus_apsp --steps 100
-python -m clrs.examples.run --algorithms bfs,min_plus_apsp --processor-type triplet_pgn --steps 100
-python -m clrs.examples.run --algorithms floyd_warshall --source published --steps 100
+uv run python examples/run.py --algorithms min_plus_apsp --steps 100
+uv run python examples/run.py --algorithms bfs,min_plus_apsp --processor-type triplet_pgn --steps 100
+uv run python examples/run.py --algorithms floyd_warshall --source published --steps 100
 ```
 
 The example reports validation and larger-graph test metrics and writes a
